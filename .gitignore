@@ -13,3 +13,9 @@ dist/
 !assets/shiba/
 !assets/shiba/**/
 !assets/shiba/**/*.png
+new_features_spec.md
+features_review.md
+improvements.md
+BuddyGPT-suggestions.md
+BuddyGPT-Improvement-Spec.md
+CHANGELOG.md

@@ -85,6 +85,7 @@ Pet character attribution: from **Nudaeng** (`@nudaengdotbonk`).
 | Hotkey / Action | Typical Use Case |
 |---|---|
 | `Ctrl+Shift+Space` | Wake BuddyGPT while you are reading an email, ticket, or docs page and want quick help. |
+| `Ctrl+Shift+V` | Wake BuddyGPT with current clipboard text as first-turn context (no screenshot required). |
 | Click the dog | Same as hotkey wake-up when your hand is already on the mouse. |
 | `Enter` | Send your question after BuddyGPT captures context. |
 | `Esc` | Close the current session immediately and send the dog back to rest. |
@@ -165,12 +166,43 @@ Use `config.json`:
 ```json
 {
   "api_key": "",
+  "openai_api_key": "",
+  "backend": "anthropic",
   "model": "claude-sonnet-4-20250514",
+  "openai_base_url": "https://api.openai.com/v1",
+  "ollama_base_url": "http://127.0.0.1:11434",
+  "backend_timeout_sec": 45,
+  "personality": "buddy",
   "hotkey_activate": "ctrl+shift+space",
+  "hotkey_clipboard": "ctrl+shift+v",
   "hotkey_quit": "ctrl+shift+q",
   "screenshot_interval": 3.0,
   "hash_threshold": 12,
-  "max_tokens": 1024,
+  "max_tokens": 400,
+  "history_window_turns": 6,
+  "history_summary_every_turns": 6,
+  "history_summary_max_chars": 1800,
+  "enable_monitor": false,
+  "allow_private_url_browse": true,
+  "context_max_chars": 9000,
+  "context_reference_refresh_turns": 3,
+  "url_cache_ttl_sec": 300,
+  "ocr_cache_ttl_sec": 300,
+  "context_telemetry": true,
+  "tray_mode": false,
+  "show_token_cost": false,
+  "enable_ocr_fallback": false,
+  "ocr_max_chars": 3000,
+  "ocr_timeout_sec": 5,
+  "ocr_preferred_apps": ["terminal", "vscode", "gmail", "outlook", "word", "pdf_reader"],
+  "tesseract_cmd": "",
+  "proactive_hints": false,
+  "proactive_sensitivity": "medium",
+  "proactive_cooldown_sec": 90,
+  "proactive_max_per_hour": 8,
+  "proactive_quiet_hours_enabled": false,
+  "proactive_quiet_start": "22:00",
+  "proactive_quiet_end": "08:00",
   "daily_chat": {
     "enabled": true,
     "push_times": ["15:00", "20:00"],
@@ -183,11 +215,46 @@ Or use `.env`:
 
 ```bash
 ANTHROPIC_API_KEY=sk-ant-xxx
+OPENAI_API_KEY=sk-proj-xxx
 ```
 
 Config priority in current code:
-1. If `config.json` has non-empty `api_key`, that key is used.
-2. Otherwise fallback to `.env` `ANTHROPIC_API_KEY`.
+1. Backend is selected via `config.json -> backend`.
+2. Anthropic key: `config.json -> api_key` then `.env -> ANTHROPIC_API_KEY`.
+3. OpenAI key: `config.json -> openai_api_key` then `.env -> OPENAI_API_KEY`.
+4. Ollama does not require an API key.
+
+Additional config notes:
+- `backend`: `anthropic`, `openai`, or `ollama`.
+- `model`: provider model name; if incompatible with selected backend, BuddyGPT falls back to a backend default model.
+- `openai_api_key`: used when `backend=openai`.
+- `ollama_base_url`: used when `backend=ollama` (default local endpoint).
+- `personality`: `buddy` (short default), `detailed`, or `terse`.
+- For `detailed` or `terse`, if `max_tokens` remains at default `400`, BuddyGPT uses the personality token default automatically.
+- `history_window_turns`: max number of recent user turns retained per session.
+- `history_summary_every_turns`: cadence for rolling history summary updates when older turns are trimmed.
+- `history_summary_max_chars`: cap for the rolling summary block added to system context.
+- `hotkey_clipboard`: wake with clipboard text context.
+- `enable_monitor`: controls whether background `ScreenMonitor` starts at app launch.
+- `proactive_hints`: if enabled (and monitor enabled), show non-LLM proactive alert nudges when significant screen changes are detected.
+- `proactive_sensitivity`: `low`, `medium`, `high`; threshold scales from `hash_threshold`.
+- `proactive_cooldown_sec` and `proactive_max_per_hour`: anti-noise controls for proactive hints.
+- `proactive_quiet_hours_enabled`: suppress proactive hints during quiet window.
+- `proactive_quiet_start` / `proactive_quiet_end`: quiet-hours window (`HH:MM` local time, supports overnight windows).
+- `allow_private_url_browse`: allows or blocks localhost/private-network URLs in direct URL browse mode.
+- `context_max_chars`: character budget used for token-aware context packing before each ask.
+- `context_reference_refresh_turns`: how often static context is resent in full vs reference-only.
+- `url_cache_ttl_sec` / `ocr_cache_ttl_sec`: cache TTLs for URL fetch and OCR reuse.
+- `context_telemetry`: enables per-turn context token estimate logging by block.
+- `tray_mode`: hide pet to system tray between interactions.
+- `show_token_cost`: display per-turn and session token cost estimate in the overlay.
+- `enable_ocr_fallback`: optional local OCR extraction for text-heavy app contexts.
+- `tesseract_cmd`: optional absolute path to `tesseract.exe`; if empty, BuddyGPT checks common Windows paths and PATH.
+
+UX notes:
+- Press `Esc` while BuddyGPT is thinking to cancel the current request.
+- Reply quick actions are available after each answer: `Explain simpler`, `Give steps`, and `Copy answer`.
+- In tray mode, you can `Snooze Hints 1h` or `Resume Hints` from the tray menu.
 
 Installed app config location:
 - `%APPDATA%\BuddyGPT\config.json`
@@ -308,7 +375,7 @@ BuddyGPT/
 
 - Windows 10/11
 - Python 3.12+
-- Anthropic API key
+- Anthropic or OpenAI API key for cloud backends, or local Ollama for keyless local mode
 
 If you see the little Shiba napping, everything is working as intended.
 
@@ -317,7 +384,7 @@ If you see the little Shiba napping, everything is working as intended.
 ### 1) Is DuckDuckGo web search free?
 
 Yes, search itself is free in this project (no separate search API key).  
-If search is used, total Claude token usage can still increase because extra model rounds are needed to read and summarize search results.
+If search is used, total model token usage can still increase because extra rounds are needed to read and summarize search results.
 
 ### 2) Does BuddyGPT keep spending tokens while idle?
 
@@ -332,4 +399,5 @@ If focus changes right before activation, context may be off. Wake it again whil
 ### 4) Do I need both `config.json` and `.env` API keys?
 
 No. Use one source of truth.  
-If `config.json` has a non-empty `api_key`, it takes priority over `.env`.
+For Anthropic: `config.json -> api_key` overrides `.env -> ANTHROPIC_API_KEY`.  
+For OpenAI: `config.json -> openai_api_key` overrides `.env -> OPENAI_API_KEY`.

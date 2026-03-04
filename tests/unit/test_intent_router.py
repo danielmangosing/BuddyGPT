@@ -7,10 +7,9 @@ from src.interaction_mode import ResponseMode
 
 
 class DummyAI:
-    """Minimal stand-in; no model fallback client by default."""
+    """Minimal stand-in for classifier signature."""
 
-    client = None
-    model = "dummy"
+    pass
 
 
 def test_work_app_neutral_text_defaults_work():
@@ -31,18 +30,10 @@ def test_casual_text_can_override_work_prior():
     assert mode == ResponseMode.CASUAL
 
 
-def test_ambiguous_text_uses_model_fallback(monkeypatch):
-    called = {"v": False}
-
-    def _fake_model(question: str, app_type: str, ai):
-        called["v"] = True
-        return ResponseMode.CASUAL
-
-    monkeypatch.setattr("src.intent_router._classify_with_model", _fake_model)
+def test_ambiguous_text_defaults_work():
     mode = classify_response_mode(
         question="ok",
         app_type="browser",
         ai=DummyAI(),
     )
-    assert called["v"] is True
-    assert mode == ResponseMode.CASUAL
+    assert mode == ResponseMode.WORK

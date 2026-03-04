@@ -72,7 +72,7 @@ def get_process_name(hwnd: int) -> str:
         kernel32.CloseHandle(handle)
 
 
-# ── Detection rules ──
+# Detection rules
 # Each rule: (process_names, title_keywords) -> AppType
 # Process names checked first, then title keywords refine the result.
 
@@ -104,12 +104,16 @@ _BROWSER_PROCESSES = {
 
 def _extract_url_hint(title: str) -> str:
     """Try to extract a domain or URL hint from a browser window title."""
-    # Browsers often show "Page Title - Site Name - Browser"
-    # or just "Page Title - Browser"
-    parts = title.rsplit(" - ", 1)
-    if len(parts) >= 1:
-        return parts[0].strip()
-    return ""
+    # Common patterns:
+    # - "Page Title - Site Name - Browser" -> Site Name
+    # - "Page Title - Browser" -> Page Title
+    # - "SingleTitle" -> SingleTitle
+    parts = [part.strip() for part in title.split(" - ") if part.strip()]
+    if len(parts) >= 3:
+        return parts[-2]
+    if len(parts) == 2:
+        return parts[0]
+    return parts[0] if parts else ""
 
 
 def _detect_browser_subtype(title: str) -> AppType:

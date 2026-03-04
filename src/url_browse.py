@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import re
 import time
@@ -121,13 +122,52 @@ def _is_supported_content_type(content_type: str) -> bool:
     return c.startswith("text/") or "json" in c or "xml" in c
 
 
-def fetch_public_page(url: str, timeout_sec: float, max_bytes: int) -> FetchedPage:
+def _is_private_or_local_host(host: str) -> bool:
+    host_l = host.strip().lower()
+    if not host_l:
+        return False
+    if host_l in {"localhost"}:
+        return True
+    if host_l.endswith(".local") or host_l.endswith(".internal"):
+        return True
+    try:
+        ip = ipaddress.ip_address(host_l)
+    except ValueError:
+        return False
+    return (
+        ip.is_loopback
+        or ip.is_private
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_unspecified
+    )
+
+
+def is_private_or_local_url(url: str) -> bool:
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    return _is_private_or_local_host(host)
+
+
+def fetch_public_page(
+    url: str,
+    timeout_sec: float,
+    max_bytes: int,
+    allow_private: bool = True,
+) -> FetchedPage:
     """Fetch one public page and return cleaned text payload."""
     start = time.monotonic()
 
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"}:
         return FetchedPage(url=url, ok=False, error="unsupported_url_scheme")
+    if is_private_or_local_url(url):
+        if not allow_private:
+            return FetchedPage(url=url, ok=False, error="private_url_blocked")
+        logger.warning(
+            "event=URL_PRIVATE_ALLOWED flow=url_browse url=%s result=allowed reason=private_or_local_host",
+            url,
+        )
 
     req = Request(url, headers={"User-Agent": USER_AGENT})
     try:

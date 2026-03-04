@@ -91,6 +91,12 @@ class DailyChatSource(NotificationSource):
         if not self.should_trigger_slot(state, slot_id, now_local):
             return None
 
+        logger.info(
+            "event=SLOT_GENERATE_START flow=daily_chat slot_id=%s date=%s time_local=%s",
+            slot_id,
+            now_local.date().isoformat(),
+            now_local.strftime("%H:%M:%S"),
+        )
         day = self._day_record(state, now_local)
         used_topics = {self._normalize_topic(t) for t in day["used_topics"]}
         used_topics.discard("")
@@ -98,10 +104,23 @@ class DailyChatSource(NotificationSource):
         result = self._generate_unique_payload(slot_id, now_local, used_topics)
         if result is None:
             self._mark_slot_status(state, now_local, slot_id, "skipped_no_unique_topic")
+            logger.info(
+                "event=SLOT_SKIPPED_NO_UNIQUE_TOPIC flow=daily_chat slot_id=%s result=skipped reason=no_unique_topic date=%s time_local=%s",
+                slot_id,
+                now_local.date().isoformat(),
+                now_local.strftime("%H:%M:%S"),
+            )
             return None
 
         topic_key, message = result
         self._mark_slot_delivered(state, now_local, slot_id, topic_key)
+        logger.info(
+            "event=SLOT_DELIVERED flow=daily_chat slot_id=%s result=delivered topic_key=%s date=%s time_local=%s",
+            slot_id,
+            topic_key,
+            now_local.date().isoformat(),
+            now_local.strftime("%H:%M:%S"),
+        )
         status = self._slot_status_text(slot_id)
         return Notification(
             source_id=f"{self.source_id}:{slot_id}",
@@ -120,19 +139,29 @@ class DailyChatSource(NotificationSource):
         now_local: datetime,
         used_topics: set[str],
     ) -> tuple[str, str] | None:
-        original_prompt = self._ai.system_prompt
-        original_max_tokens = self._ai.max_tokens
         max_retry = int(self._settings().get("max_topic_retry", DEFAULT_MAX_TOPIC_RETRY))
         max_retry = max(1, max_retry)
+        generation_system_prompt = f"{self._ai.system_prompt}\n\n{DAILY_CHAT_SYSTEM_PROMPT}"
+        if hasattr(self._ai, "spawn_with_overrides"):
+            temp_ai = self._ai.spawn_with_overrides(
+                system_prompt=generation_system_prompt,
+                max_tokens=320,
+            )
+            use_temp_instance = True
+        else:
+            temp_ai = self._ai
+            use_temp_instance = False
+            original_prompt = self._ai.system_prompt
+            original_max_tokens = self._ai.max_tokens
 
         try:
             for _ in range(max_retry):
-                self._ai.clear_history()
-                self._ai.system_prompt = f"{original_prompt}\n\n{DAILY_CHAT_SYSTEM_PROMPT}"
-                self._ai.max_tokens = 320
-
-                prompt = self._build_slot_prompt(slot_id, now_local, used_topics)
-                raw = self._ai.ask(prompt).strip()
+                temp_ai.clear_history()
+                if not use_temp_instance:
+                    temp_ai.system_prompt = generation_system_prompt
+                    temp_ai.max_tokens = 320
+                slot_prompt = self._build_slot_prompt(slot_id, now_local, used_topics)
+                raw = temp_ai.ask(slot_prompt, force_search_tool=True).strip()
                 payload = self._extract_json_payload(raw)
                 if not payload:
                     continue
@@ -147,11 +176,12 @@ class DailyChatSource(NotificationSource):
             return None
         except Exception:
             logger.exception("Daily chat generation failed for slot '%s'", slot_id)
-            self._ai.clear_history()
+            temp_ai.clear_history()
             return None
         finally:
-            self._ai.system_prompt = original_prompt
-            self._ai.max_tokens = original_max_tokens
+            if not use_temp_instance:
+                self._ai.system_prompt = original_prompt
+                self._ai.max_tokens = original_max_tokens
 
     def _build_slot_prompt(self, slot_id: str, now_local: datetime, used_topics: set[str]) -> str:
         slot_label = self._slot_label(slot_id)

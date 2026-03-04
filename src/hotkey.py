@@ -33,10 +33,17 @@ def parse_hotkey(text: str) -> set:
 
 
 class HotkeyManager:
-    def __init__(self, hotkey: set | None = None, quit_hotkey: set | None = None):
+    def __init__(
+        self,
+        hotkey: set | None = None,
+        quit_hotkey: set | None = None,
+        clipboard_hotkey: set | None = None,
+    ):
         self.hotkey = hotkey or DEFAULT_HOTKEY
         self.quit_hotkey = quit_hotkey or QUIT_HOTKEY
+        self.clipboard_hotkey = clipboard_hotkey
         self._callbacks: list = []
+        self._clipboard_callbacks: list = []
         self._quit_callbacks: list = []
         self._pressed: set = set()
         self._listener: keyboard.Listener | None = None
@@ -48,8 +55,15 @@ class HotkeyManager:
     def on_quit(self, callback):
         self._quit_callbacks.append(callback)
 
+    def on_clipboard(self, callback):
+        self._clipboard_callbacks.append(callback)
+
     def _fire(self):
         for cb in self._callbacks:
+            cb()
+
+    def _fire_clipboard(self):
+        for cb in self._clipboard_callbacks:
             cb()
 
     def _fire_quit(self):
@@ -62,6 +76,8 @@ class HotkeyManager:
         self._pressed.add(k)
         if self.quit_hotkey.issubset(self._pressed):
             self._fire_quit()
+        elif self.clipboard_hotkey and self.clipboard_hotkey.issubset(self._pressed):
+            self._fire_clipboard()
         elif self.hotkey.issubset(self._pressed):
             self._fire()
 
@@ -98,3 +114,6 @@ class HotkeyManager:
     def wait(self):
         """Block until quit hotkey is pressed."""
         self._stop_event.wait()
+
+    def request_quit(self):
+        self._fire_quit()

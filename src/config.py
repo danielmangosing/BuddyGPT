@@ -1,6 +1,7 @@
 """Load config from config.json with .env fallback for API key."""
 
 import json
+import logging
 import os
 import sys
 from pathlib import Path
@@ -8,17 +9,56 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent.parent
+logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG = {
     "api_key": "",
+    "openai_api_key": "",
     "onboarding_done": False,
     "force_onboarding": False,
+    "backend": "anthropic",
     "model": "claude-sonnet-4-20250514",
+    "openai_base_url": "https://api.openai.com/v1",
+    "ollama_base_url": "http://127.0.0.1:11434",
+    "backend_timeout_sec": 45,
+    "personality": "buddy",
     "hotkey_activate": "ctrl+shift+space",
+    "hotkey_clipboard": "ctrl+shift+v",
     "hotkey_quit": "ctrl+shift+q",
     "screenshot_interval": 3.0,
     "hash_threshold": 12,
-    "max_tokens": 1024,
+    "max_tokens": 400,
+    "history_window_turns": 6,
+    "history_summary_every_turns": 6,
+    "history_summary_max_chars": 1800,
+    "enable_monitor": False,
+    "allow_private_url_browse": True,
+    "context_max_chars": 9000,
+    "context_reference_refresh_turns": 3,
+    "url_cache_ttl_sec": 300,
+    "ocr_cache_ttl_sec": 300,
+    "context_telemetry": True,
+    "tray_mode": False,
+    "show_token_cost": False,
+    "enable_ocr_fallback": False,
+    "ocr_max_chars": 3000,
+    "ocr_timeout_sec": 5,
+    "ocr_preferred_apps": [
+        "terminal",
+        "vscode",
+        "gmail",
+        "outlook",
+        "word",
+        "pdf_reader",
+    ],
+    "tesseract_cmd": "",
+    "proactive_hints": False,
+    "proactive_sensitivity": "medium",
+    "proactive_cooldown_sec": 90,
+    "proactive_max_per_hour": 8,
+    "proactive_quiet_hours_enabled": False,
+    "proactive_quiet_start": "22:00",
+    "proactive_quiet_end": "08:00",
     "daily_chat": {
         "enabled": True,
         "push_times": ["15:00", "20:00"],
@@ -59,8 +99,12 @@ def load_config() -> dict:
     for config_path in _config_candidates():
         if not config_path.exists():
             continue
-        with open(config_path, "r", encoding="utf-8-sig") as f:
-            user = json.load(f)
+        try:
+            with open(config_path, "r", encoding="utf-8-sig") as f:
+                user = json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("Ignoring unreadable config file %s: %s", config_path, exc)
+            continue
         config.update({k: v for k, v in user.items() if v != ""})
         break
 
@@ -72,9 +116,11 @@ def load_config() -> dict:
     merged_daily_chat.update(daily_chat_cfg)
     config["daily_chat"] = merged_daily_chat
 
-    # .env overrides empty api_key
+    # .env overrides empty keys
     if not config["api_key"]:
         config["api_key"] = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not config["openai_api_key"]:
+        config["openai_api_key"] = os.environ.get("OPENAI_API_KEY", "")
 
     return config
 
