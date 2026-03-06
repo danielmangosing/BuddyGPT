@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import hashlib
 import sys
 import threading
 import time
@@ -18,37 +17,24 @@ from src.ai_assistant import AIAssistant
 from src.app_detector import AppInfo, detect_app
 from src.clipboard_utils import get_clipboard_text
 from src.config import load_config, save_user_config
-from src.content_filter import build_context_prompt, filter_content
+from src.content_filter import filter_content
+from src.context_state import ContextAvailability, ContextControls, RecoveryViewState
 from src.hotkey import HotkeyManager, parse_hotkey
-from src.intent_router import classify_response_mode
-from src.interaction_mode import AssistantTurnResult, ResponseMode
+from src.log_events import log_event
 from src.monitor import MonitorConfig, ScreenMonitor
 from src.notifications import DailyChatSource, NotificationManager
-from src.ocr import DEFAULT_PREFERRED_APPS, extract_ocr_text, should_use_ocr
 from src.overlay import OverlayWindow
 from src.pet import PetState
 from src.proactive import ProactiveHintController
 from src.prompts import PERSONALITIES
+from src.recovery import SessionRecoverySnapshot
 from src.screenshot import capture_window, get_active_hwnd
-from src.url_browse import (
-    DEFAULT_GLOBAL_TIMEOUT,
-    DEFAULT_MAX_BYTES,
-    DEFAULT_MAX_CHARS_PER_URL,
-    DEFAULT_MAX_TOTAL_CHARS,
-    DEFAULT_PER_URL_TIMEOUT,
-    FetchedPage,
-    build_browse_context,
-    extract_urls,
-    fetch_public_page,
-)
+from src.settings import AppSettings
+from src.turn_pipeline import TurnPipeline
+from src.url_browse import FetchedPage
 
 WAKE_FIRST_SLOT = "wake_first"
 SCHEDULE_POLL_SECONDS = 20
-URL_PER_TIMEOUT = DEFAULT_PER_URL_TIMEOUT
-URL_GLOBAL_TIMEOUT = DEFAULT_GLOBAL_TIMEOUT
-URL_MAX_BYTES = DEFAULT_MAX_BYTES
-URL_MAX_CHARS_PER_URL = DEFAULT_MAX_CHARS_PER_URL
-URL_MAX_TOTAL_CHARS = DEFAULT_MAX_TOTAL_CHARS
 
 
 def _safe_set_utf8(stream):
@@ -131,11 +117,10 @@ def _build_ai_instance(
     cfg_override: dict | None = None,
     openai_api_key_override: str | None = None,
 ) -> AIAssistant:
-    config = cfg_override or cfg
-    backend_name = _backend_name(config)
-    personality = str(config.get("personality", "buddy")).lower()
-    max_tokens_raw = config.get("max_tokens", 400)
-    max_tokens = int(max_tokens_raw)
+    settings = AppSettings.from_dict(cfg_override or cfg)
+    backend_name = settings.backend.strip().lower()
+    personality = settings.personality.lower()
+    max_tokens = int(settings.max_tokens)
     buddy_default = int(PERSONALITIES["buddy"]["max_tokens"])
 
     max_tokens_override = max_tokens
@@ -143,22 +128,23 @@ def _build_ai_instance(
         max_tokens_override = None
 
     return AIAssistant(
-        api_key=api_key if api_key is not None else config["api_key"],
-        model=config["model"],
+        api_key=api_key if api_key is not None else settings.api_key,
+        model=settings.model,
         personality=personality,
         max_tokens=max_tokens_override,
-        history_window_turns=int(config.get("history_window_turns", 6)),
-        history_summary_every_turns=int(config.get("history_summary_every_turns", 6)),
-        history_summary_max_chars=int(config.get("history_summary_max_chars", 1800)),
+        history_window_turns=settings.history_window_turns,
+        history_summary_every_turns=settings.history_summary_every_turns,
+        history_summary_max_chars=settings.history_summary_max_chars,
+        search_cache_ttl_sec=settings.search_cache_ttl_sec,
         backend=backend_name,
         openai_api_key=(
             openai_api_key_override
             if openai_api_key_override is not None
-            else config.get("openai_api_key", "")
+            else settings.openai_api_key
         ),
-        ollama_base_url=config.get("ollama_base_url", "http://127.0.0.1:11434"),
-        openai_base_url=config.get("openai_base_url", "https://api.openai.com/v1"),
-        backend_timeout_sec=int(config.get("backend_timeout_sec", 45)),
+        ollama_base_url=settings.ollama_base_url,
+        openai_base_url=settings.openai_base_url,
+        backend_timeout_sec=settings.backend_timeout_sec,
     )
 
 
@@ -166,6 +152,7 @@ def _build_ai_instance(
 class AppRuntime:
     cfg: dict
     ai: AIAssistant
+    turn_pipeline: TurnPipeline | None = None
     target_hwnd: int = 0
     current_app: AppInfo | None = None
     clipboard_context_text: str = ""
@@ -183,8 +170,11 @@ class AppRuntime:
     static_context_hash: str = ""
     static_context_id: str = ""
     static_context_last_full_turn: int = 0
+    previous_context_blocks: dict[str, str] = field(default_factory=dict)
     url_cache: dict[str, tuple[float, FetchedPage]] = field(default_factory=dict)
+    url_summary_cache: dict[str, tuple[float, str, str]] = field(default_factory=dict)
     ocr_cache: dict[str, tuple[float, str]] = field(default_factory=dict)
+    recovery_snapshot: SessionRecoverySnapshot | None = None
 
 
 def _build_notification_manager(rt: AppRuntime) -> NotificationManager:
@@ -199,6 +189,7 @@ def _create_runtime(config: dict | None = None) -> AppRuntime:
     rt = AppRuntime(
         cfg=config,
         ai=_build_ai_instance(cfg_override=config),
+        turn_pipeline=TurnPipeline(status_callback=lambda text: _overlay_status_update(text)),
         onboarding_needed=_compute_onboarding_needed(config),
     )
     rt.notification_manager = _build_notification_manager(rt)
@@ -223,156 +214,98 @@ def _overlay_status_update(text: str) -> None:
         overlay.update_thinking_status(text)
 
 
-def _is_cancelled(cancel_token: Any) -> bool:
-    return bool(cancel_token is not None and hasattr(cancel_token, "is_set") and cancel_token.is_set())
+def _settings(config: dict) -> AppSettings:
+    return AppSettings.from_dict(config)
 
 
-def _estimate_tokens(text: str) -> int:
-    # Fast approximation suitable for relative telemetry.
-    return max(1, len(text) // 4) if text else 0
+def _reset_session_context(rt: AppRuntime) -> None:
+    rt.static_context_hash = ""
+    rt.static_context_id = ""
+    rt.static_context_last_full_turn = 0
+    rt.turn_counter = 0
+    rt.previous_context_blocks = {}
+    rt.recovery_snapshot = None
 
 
-def _evict_stale_cache_entries(rt: AppRuntime, *, now_mono: float) -> None:
-    url_ttl = max(1, int(rt.cfg.get("url_cache_ttl_sec", 300)))
-    ocr_ttl = max(1, int(rt.cfg.get("ocr_cache_ttl_sec", 300)))
-    rt.url_cache = {
-        k: v for k, v in rt.url_cache.items() if (now_mono - v[0]) <= url_ttl
-    }
-    rt.ocr_cache = {
-        k: v for k, v in rt.ocr_cache.items() if (now_mono - v[0]) <= ocr_ttl
-    }
-
-
-def _get_cached_url_page(rt: AppRuntime, url: str, *, now_mono: float) -> FetchedPage | None:
-    entry = rt.url_cache.get(url)
-    if entry is None:
-        return None
-    ts, page = entry
-    ttl = max(1, int(rt.cfg.get("url_cache_ttl_sec", 300)))
-    if (now_mono - ts) > ttl:
-        return None
-    return page
-
-
-def _set_cached_url_page(rt: AppRuntime, url: str, page: FetchedPage, *, now_mono: float) -> None:
-    rt.url_cache[url] = (now_mono, page)
-
-
-def _image_cache_key(image) -> str:
-    if image is None or not hasattr(image, "convert"):
-        return ""
-    gray = image.convert("L")
-    small = gray.resize((128, 128))
-    return hashlib.blake2b(small.tobytes(), digest_size=16).hexdigest()
-
-
-def _get_cached_ocr_text(rt: AppRuntime, key: str, *, now_mono: float) -> str:
-    if not key:
-        return ""
-    entry = rt.ocr_cache.get(key)
-    if entry is None:
-        return ""
-    ts, text = entry
-    ttl = max(1, int(rt.cfg.get("ocr_cache_ttl_sec", 300)))
-    if (now_mono - ts) > ttl:
-        return ""
-    return text
-
-
-def _set_cached_ocr_text(rt: AppRuntime, key: str, text: str, *, now_mono: float) -> None:
-    if key and text:
-        rt.ocr_cache[key] = (now_mono, text)
-
-
-def _pack_context_blocks(
-    *,
-    blocks: list[dict[str, Any]],
-    question: str,
-    max_chars: int,
-) -> tuple[list[tuple[str, str]], list[dict[str, Any]], bool]:
-    """Token-budgeted context packing with priority and trimming."""
-    max_chars = max(1000, int(max_chars))
-    question_len = len(question)
-    remaining = max(max_chars - question_len, 0)
-    selected: list[tuple[int, int, str, str]] = []
-    dropped: list[dict[str, Any]] = []
-    used = 0
-
-    for idx, block in enumerate(blocks):
-        name = str(block.get("name", f"block_{idx}"))
-        text = str(block.get("text", ""))
-        if not text:
-            continue
-        priority = int(block.get("priority", 50))
-        required = bool(block.get("required", False))
-        allow_trim = bool(block.get("allow_trim", False))
-        length = len(text)
-
-        if required and (used + length) > remaining:
-            if remaining <= used:
-                dropped.append({"name": name, "reason": "no_budget"})
-                continue
-            if allow_trim:
-                trim_to = max(0, remaining - used)
-                if trim_to > 0:
-                    trimmed = text[:trim_to]
-                    selected.append((priority, idx, name, trimmed))
-                    used += len(trimmed)
-                else:
-                    dropped.append({"name": name, "reason": "no_budget"})
-            else:
-                dropped.append({"name": name, "reason": "no_budget"})
-            continue
-
-        selected.append((priority, idx, name, text))
-        used += length
-
-    # Keep higher-priority blocks first, then stable order.
-    selected.sort(key=lambda item: (-item[0], item[1]))
-    packed: list[tuple[str, str]] = []
-    final_used = 0
-    trimmed = False
-    for priority, idx, name, text in selected:
-        text_len = len(text)
-        if (final_used + text_len) <= remaining:
-            packed.append((name, text))
-            final_used += text_len
-            continue
-        # Attempt tail-trim only for lower-priority long blocks.
-        if text_len > 0 and priority < 60:
-            remain = remaining - final_used
-            if remain > 0:
-                packed.append((name, text[:remain]))
-                final_used += remain
-                trimmed = True
-            else:
-                dropped.append({"name": name, "reason": "budget_pruned"})
-            continue
-        dropped.append({"name": name, "reason": "budget_pruned"})
-
-    return packed, dropped, trimmed
-
-
-def _log_context_telemetry(
-    *,
-    enabled: bool,
-    included_blocks: list[tuple[str, str]],
-    dropped: list[dict[str, Any]],
-    question: str,
-) -> None:
-    if not enabled:
-        return
-    token_by_block = {name: _estimate_tokens(text) for name, text in included_blocks}
-    token_by_block["question"] = _estimate_tokens(question)
-    total = sum(token_by_block.values())
-    dropped_desc = ",".join(f"{d['name']}:{d['reason']}" for d in dropped) if dropped else "none"
-    block_desc = ",".join(f"{k}:{v}" for k, v in token_by_block.items())
-    logger.info(
-        "event=CONTEXT_PACK flow=submit result=packed est_tokens_total=%d blocks=%s dropped=%s",
-        total,
-        block_desc,
-        dropped_desc,
+def _default_context_availability(*, has_screenshot: bool, has_clipboard: bool) -> ContextAvailability:
+    return ContextAvailability(
+        screenshot=has_screenshot,
+        clipboard=has_clipboard,
+        urls=True,
+        ocr=has_screenshot,
     )
+
+
+def _store_recovery_snapshot(view: RecoveryViewState) -> None:
+    rt = runtime
+    if rt.onboarding_needed:
+        return
+    if not (view.answer_text or view.draft_text or rt.ai.history):
+        return
+    with rt.state_lock:
+        target_hwnd = rt.target_hwnd
+        current_app = rt.current_app
+        clip_text = rt.clipboard_context_text
+        clip_pending = rt.clipboard_context_pending
+    rt.recovery_snapshot = SessionRecoverySnapshot(
+        created_at=time.monotonic(),
+        view=view,
+        assistant_state=rt.ai.snapshot_session_state(),
+        window_title=getattr(rt.active_overlay, "_window_title", "BuddyGPT"),
+        target_hwnd=target_hwnd,
+        current_app=current_app,
+        clipboard_context_text=clip_text,
+        clipboard_context_pending=clip_pending,
+        static_context_hash=rt.static_context_hash,
+        static_context_id=rt.static_context_id,
+        static_context_last_full_turn=rt.static_context_last_full_turn,
+        turn_counter=rt.turn_counter,
+        previous_context_blocks=dict(rt.previous_context_blocks),
+        image=getattr(rt.active_overlay, "_image", None),
+    )
+    log_event(
+        logger,
+        "SESSION_SNAPSHOT",
+        "dismiss",
+        "stored",
+        has_answer=int(bool(view.answer_text)),
+        has_draft=int(bool(view.draft_text)),
+        history_turns=len(rt.ai.history),
+    )
+
+
+def _restore_recent_session(rt: AppRuntime, overlay: OverlayWindow) -> bool:
+    snapshot = rt.recovery_snapshot
+    if snapshot is None:
+        return False
+    ttl_sec = max(10, _settings(rt.cfg).session_recovery_ttl_sec)
+    if (time.monotonic() - snapshot.created_at) > ttl_sec:
+        rt.recovery_snapshot = None
+        return False
+
+    rt.ai.restore_session_state(snapshot.assistant_state)
+    with rt.state_lock:
+        rt.target_hwnd = snapshot.target_hwnd
+        rt.current_app = snapshot.current_app
+        rt.clipboard_context_text = snapshot.clipboard_context_text
+        rt.clipboard_context_pending = snapshot.clipboard_context_pending
+    rt.static_context_hash = snapshot.static_context_hash
+    rt.static_context_id = snapshot.static_context_id
+    rt.static_context_last_full_turn = snapshot.static_context_last_full_turn
+    rt.turn_counter = snapshot.turn_counter
+    rt.previous_context_blocks = dict(snapshot.previous_context_blocks)
+    overlay.restore_session(
+        answer_text=snapshot.view.answer_text,
+        draft_text=snapshot.view.draft_text,
+        response_mode=snapshot.view.response_mode,
+        controls=snapshot.view.controls,
+        availability=snapshot.view.availability,
+        image=snapshot.image,
+        window_title=f"{snapshot.window_title} (Recovered)",
+    )
+    rt.recovery_snapshot = None
+    log_event(logger, "SESSION_RECOVERY", "manual_activation", "restored")
+    return True
 
 
 def on_screen_change(frame, distance):
@@ -517,268 +450,20 @@ def _handle_onboarding_submit(rt: AppRuntime, question: str) -> str:
     return _validate_and_save_onboarding_key(rt, backend, text)
 
 
-def on_submit(question, image, *, cancel_token=None):
+def on_submit(question, image, *, cancel_token=None, controls: ContextControls | None = None):
     """Called by overlay UI when user submits a question."""
     rt = runtime
     if rt.onboarding_needed:
         return _handle_onboarding_submit(rt, question)
-
-    now_mono = time.monotonic()
-    _evict_stale_cache_entries(rt, now_mono=now_mono)
-    rt.turn_counter += 1
-
-    with rt.state_lock:
-        hwnd = rt.target_hwnd
-        app = rt.current_app
-        clip_text = rt.clipboard_context_text
-        clip_pending = rt.clipboard_context_pending
-        if rt.clipboard_context_pending and rt.clipboard_context_text:
-            rt.clipboard_context_pending = False
-
-    if image is None and hwnd:
-        raw = capture_window(hwnd)
-        if raw and app:
-            image = filter_content(raw, app)
-
-    app_type = app.app_type.value if app else ""
-    response_mode = classify_response_mode(question=question, app_type=app_type, ai=rt.ai)
-    if _is_cancelled(cancel_token):
-        return AssistantTurnResult(text="Request cancelled.", response_mode=response_mode)
-    mode_hint = "focus on actionable, task-oriented response"
-    if response_mode == ResponseMode.CASUAL:
-        mode_hint = "light conversational response"
-
-    urls = extract_urls(question)
-    browse_context = ""
-    browse_warning = ""
-    if urls:
-        _overlay_status_update("Fetching links...")
-        pages = []
-        failures: list[str] = []
-        allow_private_urls = bool(rt.cfg.get("allow_private_url_browse", True))
-        deadline = time.monotonic() + URL_GLOBAL_TIMEOUT
-        for url in urls:
-            if _is_cancelled(cancel_token):
-                return AssistantTurnResult(text="Request cancelled.", response_mode=response_mode)
-            cached_page = _get_cached_url_page(rt, url, now_mono=time.monotonic())
-            if cached_page is not None:
-                logger.info("URL browse cache hit: url=%s ok=%s", url, cached_page.ok)
-                page = cached_page
-            else:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    failures.append(f"{url} (global_timeout)")
-                    continue
-                timeout_sec = min(URL_PER_TIMEOUT, remaining)
-                logger.info("URL browse start: url=%s timeout=%.2fs", url, timeout_sec)
-                page = fetch_public_page(
-                    url=url,
-                    timeout_sec=timeout_sec,
-                    max_bytes=URL_MAX_BYTES,
-                    allow_private=allow_private_urls,
-                )
-                _set_cached_url_page(rt, url, page, now_mono=time.monotonic())
-                if not page.ok:
-                    logger.info("URL browse failed: url=%s reason=%s", url, page.error)
-                else:
-                    logger.info(
-                        "URL browse success: url=%s type=%s duration_ms=%d",
-                        url,
-                        page.content_type,
-                        page.duration_ms,
-                    )
-            if not page.ok:
-                failures.append(f"{url} ({page.error})")
-                continue
-            pages.append(page)
-
-        if failures and not pages:
-            msg = (
-                "I could not browse those links right now. "
-                "Please retry or send accessible public pages only.\n"
-                f"Failed links: {'; '.join(failures)}"
-            )
-            return AssistantTurnResult(text=msg, response_mode=response_mode)
-        if failures:
-            browse_warning = (
-                "[Direct URL browse note]\n"
-                f"Some links could not be fetched: {'; '.join(failures)}"
-            )
-        if pages:
-            browse_context = build_browse_context(
-                pages=pages,
-                max_chars_per_url=URL_MAX_CHARS_PER_URL,
-                max_total_chars=URL_MAX_TOTAL_CHARS,
-            )
-
-    app_context_block = ""
-    if app:
-        app_context_block = f"[{build_context_prompt(app)}]"
-
-    clipboard_block = ""
-    if clip_pending and clip_text:
-        clipboard_block = f"[Clipboard context]\n{clip_text}"
-
-    ocr_text = ""
-    ocr_block = ""
-    if image is not None and should_use_ocr(
-        app_type=app_type,
-        enabled=bool(rt.cfg.get("enable_ocr_fallback", False)),
-        preferred_apps=rt.cfg.get("ocr_preferred_apps", list(DEFAULT_PREFERRED_APPS)),
-    ):
-        if _is_cancelled(cancel_token):
-            return AssistantTurnResult(text="Request cancelled.", response_mode=response_mode)
-        _overlay_status_update("Running OCR...")
-        ocr_key = _image_cache_key(image)
-        ocr_text = _get_cached_ocr_text(rt, ocr_key, now_mono=time.monotonic())
-        if not ocr_text:
-            ocr_text = extract_ocr_text(
-                image,
-                max_chars=int(rt.cfg.get("ocr_max_chars", 3000)),
-                timeout_sec=int(rt.cfg.get("ocr_timeout_sec", 5)),
-                tesseract_cmd=str(rt.cfg.get("tesseract_cmd", "")),
-            )
-            _set_cached_ocr_text(rt, ocr_key, ocr_text, now_mono=time.monotonic())
-        else:
-            logger.info("OCR cache hit: key=%s chars=%d", ocr_key[:8], len(ocr_text))
-        if _is_cancelled(cancel_token):
-            return AssistantTurnResult(text="Request cancelled.", response_mode=response_mode)
-        if ocr_text:
-            ocr_block = f"[Screen text (OCR)]\n{ocr_text}"
-
-    browse_context_block = f"[Direct URL browse context]\n{browse_context}" if browse_context else ""
-    browse_warning_block = browse_warning or ""
-
-    static_payload = "\n\n".join(
-        [
-            part
-            for part in [
-                app_context_block,
-                clipboard_block,
-                ocr_block,
-                browse_context_block,
-                browse_warning_block,
-            ]
-            if part
-        ]
+    if rt.turn_pipeline is None:
+        rt.turn_pipeline = TurnPipeline(status_callback=lambda text: _overlay_status_update(text))
+    return rt.turn_pipeline.submit(
+        rt,
+        question,
+        image,
+        cancel_token=cancel_token,
+        controls=controls,
     )
-    static_hash = hashlib.sha1(static_payload.encode("utf-8")).hexdigest() if static_payload else ""
-    refresh_turns = max(1, int(rt.cfg.get("context_reference_refresh_turns", 3)))
-    use_context_reference = (
-        bool(static_hash)
-        and static_hash == rt.static_context_hash
-        and bool(rt.static_context_id)
-        and (rt.turn_counter - rt.static_context_last_full_turn) < refresh_turns
-    )
-    if static_hash and not use_context_reference:
-        rt.static_context_hash = static_hash
-        rt.static_context_id = static_hash[:8]
-        rt.static_context_last_full_turn = rt.turn_counter
-    if not static_hash:
-        rt.static_context_hash = ""
-        rt.static_context_id = ""
-        rt.static_context_last_full_turn = 0
-
-    context_blocks: list[dict[str, Any]] = []
-    if use_context_reference:
-        context_blocks.append(
-            {
-                "name": "context_ref",
-                "text": (
-                    f"[Context reference id: {rt.static_context_id}]\n"
-                    "Reuse static context from previous turn in this session."
-                ),
-                "priority": 95,
-                "required": True,
-            }
-        )
-    else:
-        if rt.static_context_id:
-            context_blocks.append(
-                {
-                    "name": "context_id",
-                    "text": f"[Context id: {rt.static_context_id}]",
-                    "priority": 95,
-                    "required": False,
-                }
-            )
-        if app_context_block:
-            context_blocks.append(
-                {"name": "app", "text": app_context_block, "priority": 90, "required": False}
-            )
-        if clipboard_block:
-            context_blocks.append(
-                {
-                    "name": "clipboard",
-                    "text": clipboard_block,
-                    "priority": 85,
-                    "required": False,
-                    "allow_trim": True,
-                }
-            )
-        if ocr_block:
-            context_blocks.append(
-                {
-                    "name": "ocr",
-                    "text": ocr_block,
-                    "priority": 82,
-                    "required": False,
-                    "allow_trim": True,
-                }
-            )
-        if browse_warning_block:
-            context_blocks.append(
-                {
-                    "name": "browse_warning",
-                    "text": browse_warning_block,
-                    "priority": 65,
-                    "required": False,
-                }
-            )
-        if browse_context_block:
-            context_blocks.append(
-                {
-                    "name": "browse_context",
-                    "text": browse_context_block,
-                    "priority": 20,
-                    "required": False,
-                    "allow_trim": True,
-                }
-            )
-
-    context_blocks.append(
-        {
-            "name": "mode_hint",
-            "text": f"[Mode hint] {mode_hint}",
-            "priority": 75,
-            "required": True,
-        }
-    )
-
-    packed_blocks, dropped, _trimmed = _pack_context_blocks(
-        blocks=context_blocks,
-        question=question,
-        max_chars=int(rt.cfg.get("context_max_chars", 9000)),
-    )
-    full_question = "\n\n".join([text for _name, text in packed_blocks] + [question])
-
-    _log_context_telemetry(
-        enabled=bool(rt.cfg.get("context_telemetry", True)),
-        included_blocks=packed_blocks,
-        dropped=dropped,
-        question=question,
-    )
-
-    if _is_cancelled(cancel_token):
-        return AssistantTurnResult(text="Request cancelled.", response_mode=response_mode)
-    _overlay_status_update("Thinking...")
-    answer = rt.ai.ask(
-        full_question,
-        image=image,
-        search_hint_question=question,
-        ocr_text=ocr_text,
-    )
-    return AssistantTurnResult(text=answer, response_mode=response_mode)
 
 
 def _deliver_daily_news_slot(slot_id: str, overlay: OverlayWindow, now_local: datetime | None = None) -> bool:
@@ -796,16 +481,14 @@ def _deliver_daily_news_slot(slot_id: str, overlay: OverlayWindow, now_local: da
     with rt.state_lock:
         rt.target_hwnd = 0
         rt.current_app = None
-    rt.static_context_hash = ""
-    rt.static_context_id = ""
-    rt.static_context_last_full_turn = 0
-    rt.turn_counter = 0
+    _reset_session_context(rt)
     overlay.show_notice(
         notification.text,
         hint=notification.hint,
         status=notification.status,
         pet_state=notification.pet_state,
     )
+    overlay.set_context_availability(_default_context_availability(has_screenshot=False, has_clipboard=False))
     return True
 
 
@@ -878,10 +561,7 @@ def on_activate(overlay):
             with rt.state_lock:
                 rt.clipboard_context_text = ""
                 rt.clipboard_context_pending = False
-            rt.static_context_hash = ""
-            rt.static_context_id = ""
-            rt.static_context_last_full_turn = 0
-            rt.turn_counter = 0
+            _reset_session_context(rt)
             overlay.show(image=None, window_title="BuddyGPT Onboarding")
             overlay.show_notice(
                 _onboarding_prompt(rt.cfg),
@@ -889,6 +569,12 @@ def on_activate(overlay):
                 status="Setup: API key needed",
                 pet_state=PetState.GREETING,
             )
+            overlay.set_context_availability(
+                _default_context_availability(has_screenshot=False, has_clipboard=False)
+            )
+            return
+
+        if _restore_recent_session(rt, overlay):
             return
 
         with rt.news_lock:
@@ -906,10 +592,7 @@ def on_activate(overlay):
                         with rt.state_lock:
                             rt.clipboard_context_text = ""
                             rt.clipboard_context_pending = False
-                        rt.static_context_hash = ""
-                        rt.static_context_id = ""
-                        rt.static_context_last_full_turn = 0
-                        rt.turn_counter = 0
+                        _reset_session_context(rt)
                         logger.info(
                             "event=SLOT_DELIVERED flow=wake_activation slot_id=%s result=delivered",
                             WAKE_FIRST_SLOT,
@@ -929,10 +612,7 @@ def on_activate(overlay):
                 rt.current_app = app
                 rt.clipboard_context_text = ""
                 rt.clipboard_context_pending = False
-            rt.static_context_hash = ""
-            rt.static_context_id = ""
-            rt.static_context_last_full_turn = 0
-            rt.turn_counter = 0
+            _reset_session_context(rt)
             img = capture_window(hwnd)
             if img and app:
                 img = filter_content(img, app)
@@ -947,6 +627,9 @@ def on_activate(overlay):
                 logger.info("Activated: unknown app hwnd=%d", hwnd)
                 window_title = "BuddyGPT"
             overlay.show(image=img, window_title=window_title)
+            overlay.set_context_availability(
+                _default_context_availability(has_screenshot=img is not None, has_clipboard=False)
+            )
     finally:
         _end_activation(rt)
 
@@ -969,16 +652,16 @@ def on_activate_clipboard(overlay):
             return
 
         if rt.onboarding_needed:
-            rt.static_context_hash = ""
-            rt.static_context_id = ""
-            rt.static_context_last_full_turn = 0
-            rt.turn_counter = 0
+            _reset_session_context(rt)
             overlay.show(image=None, window_title="BuddyGPT Onboarding")
             overlay.show_notice(
                 _onboarding_prompt(rt.cfg),
                 hint=_onboarding_hint(rt.cfg),
                 status="Setup: API key needed",
                 pet_state=PetState.GREETING,
+            )
+            overlay.set_context_availability(
+                _default_context_availability(has_screenshot=False, has_clipboard=False)
             )
             return
 
@@ -1003,10 +686,7 @@ def on_activate_clipboard(overlay):
             rt.current_app = app
             rt.clipboard_context_text = clip_text
             rt.clipboard_context_pending = True
-        rt.static_context_hash = ""
-        rt.static_context_id = ""
-        rt.static_context_last_full_turn = 0
-        rt.turn_counter = 0
+        _reset_session_context(rt)
 
         rt.ai.clear_history()
         rt.ai.set_app_context(app.app_type.value if app else "")
@@ -1016,6 +696,9 @@ def on_activate_clipboard(overlay):
             hint="Enter ask - Esc dismiss",
             status="Clipboard mode",
             pet_state=None,
+        )
+        overlay.set_context_availability(
+            _default_context_availability(has_screenshot=False, has_clipboard=True)
         )
         logger.info(
             "event=CLIPBOARD_CAPTURE flow=clipboard_activation result=captured chars=%d",
@@ -1114,11 +797,12 @@ def _setup_tray_icon(overlay: OverlayWindow, hk: HotkeyManager):
 
 def main():
     rt = runtime
-    activate_keys = rt.cfg["hotkey_activate"]
-    clipboard_keys = rt.cfg.get("hotkey_clipboard", "ctrl+shift+v")
-    quit_keys = rt.cfg["hotkey_quit"]
-    tray_mode = bool(rt.cfg.get("tray_mode", False))
-    backend = _backend_name(rt.cfg)
+    settings = _settings(rt.cfg)
+    activate_keys = settings.hotkey_activate
+    clipboard_keys = settings.hotkey_clipboard
+    quit_keys = settings.hotkey_quit
+    tray_mode = settings.tray_mode
+    backend = settings.backend.strip().lower()
 
     print("=" * 50)
     print("  BuddyGPT - Screen AI Assistant")
@@ -1134,8 +818,9 @@ def main():
     overlay = OverlayWindow(
         on_submit=on_submit,
         on_activate=lambda: on_activate(overlay),
+        on_dismiss=_store_recovery_snapshot,
         tray_mode=tray_mode,
-        show_token_cost=bool(rt.cfg.get("show_token_cost", False)),
+        show_token_cost=settings.show_token_cost,
         usage_provider=lambda: rt.ai.get_last_usage(),
     )
     rt.active_overlay = overlay

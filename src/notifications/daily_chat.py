@@ -161,7 +161,11 @@ class DailyChatSource(NotificationSource):
                     temp_ai.system_prompt = generation_system_prompt
                     temp_ai.max_tokens = 320
                 slot_prompt = self._build_slot_prompt(slot_id, now_local, used_topics)
-                raw = temp_ai.ask(slot_prompt, force_search_tool=True).strip()
+                raw = temp_ai.ask(
+                    slot_prompt,
+                    force_search_tool=True,
+                    search_hint_question=self._build_search_query(slot_id, now_local),
+                ).strip()
                 payload = self._extract_json_payload(raw)
                 if not payload:
                     continue
@@ -194,6 +198,13 @@ class DailyChatSource(NotificationSource):
             f"Current slot is {slot_label}. "
             f"Already used topic keys today: {used}. "
             "Return JSON only."
+        )
+
+    def _build_search_query(self, slot_id: str, now_local: datetime) -> str:
+        slot_label = self._slot_label(slot_id)
+        return (
+            f"latest major news headlines {now_local.strftime('%Y-%m-%d')} "
+            f"for BuddyGPT {slot_label}"
         )
 
     def _extract_json_payload(self, text: str) -> dict[str, Any] | None:

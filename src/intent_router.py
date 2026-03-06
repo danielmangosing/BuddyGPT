@@ -85,14 +85,10 @@ def _normalize_output_to_mode(raw: str) -> ResponseMode:
 
 def _classify_with_model(question: str, app_type: str, ai) -> ResponseMode:
     """Fallback classifier using model output `work` or `casual`."""
+    backend = getattr(ai, "backend", None)
+    chat_fn = getattr(backend, "chat", None)
     client = getattr(ai, "client", None)
     model = getattr(ai, "model", None)
-    if client is None or not model:
-        return ResponseMode.WORK
-    messages_api = getattr(client, "messages", None)
-    create_fn = getattr(messages_api, "create", None)
-    if create_fn is None:
-        return ResponseMode.WORK
 
     prompt = (
         "Classify the user's message into exactly one label: work or casual.\n"
@@ -105,6 +101,23 @@ def _classify_with_model(question: str, app_type: str, ai) -> ResponseMode:
     )
 
     try:
+        if callable(chat_fn):
+            response = chat_fn(
+                messages=[{"role": "user", "content": prompt}],
+                system=(
+                    "You are a strict classifier. Return exactly one word only: "
+                    "work or casual."
+                ),
+                max_tokens=8,
+            )
+            return _normalize_output_to_mode(getattr(response, "text", response))
+
+        if client is None or not model:
+            return ResponseMode.WORK
+        messages_api = getattr(client, "messages", None)
+        create_fn = getattr(messages_api, "create", None)
+        if create_fn is None:
+            return ResponseMode.WORK
         response = create_fn(
             model=model,
             max_tokens=8,

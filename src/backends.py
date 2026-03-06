@@ -41,10 +41,24 @@ class BackendResponse:
     cached_tokens: int = 0
 
 
+@dataclass(slots=True)
+class BackendCapabilities:
+    tools: bool = False
+    vision: bool = False
+    direct_search_augmentation: bool = True
+
+
 class ModelBackend:
-    supports_tools: bool = False
-    supports_vision: bool = False
     backend_name: str = ""
+    capabilities = BackendCapabilities()
+
+    @property
+    def supports_tools(self) -> bool:
+        return bool(self.capabilities.tools)
+
+    @property
+    def supports_vision(self) -> bool:
+        return bool(self.capabilities.vision)
 
     def chat(
         self,
@@ -127,8 +141,7 @@ def _extract_text_blocks(content: Any) -> str:
 
 class AnthropicBackend(ModelBackend):
     backend_name = "anthropic"
-    supports_tools = True
-    supports_vision = True
+    capabilities = BackendCapabilities(tools=True, vision=True, direct_search_augmentation=False)
 
     def __init__(self, api_key: str | None, model: str):
         self.model = model
@@ -265,8 +278,7 @@ class AnthropicBackend(ModelBackend):
 
 class OpenAIBackend(ModelBackend):
     backend_name = "openai"
-    supports_tools = False
-    supports_vision = True
+    capabilities = BackendCapabilities(tools=False, vision=True, direct_search_augmentation=True)
 
     def __init__(
         self,
@@ -404,8 +416,7 @@ class OpenAIBackend(ModelBackend):
 
 class OllamaBackend(ModelBackend):
     backend_name = "ollama"
-    supports_tools = False
-    supports_vision = True
+    capabilities = BackendCapabilities(tools=False, vision=True, direct_search_augmentation=True)
 
     def __init__(
         self,

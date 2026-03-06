@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import base64
+import copy
 import io
 import logging
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,7 @@ _IMAGE_PRESETS = {
 }
 _DEFAULT_PRESET = {"max_size": 1024, "quality": 70}
 _OCR_PRESET = {"max_size": 512, "quality": 40}
+_ARTIFACT_PATTERN = re.compile(r"(https?://\S+|[A-Za-z]:\\[^\s]+|[\w./\\-]+\.[A-Za-z0-9]{1,8})")
 
 _SEARCH_KEYWORDS = {
     "latest",
@@ -126,6 +128,35 @@ class UsageStats:
     session_total_usd: float = 0.0
 
 
+@dataclass
+class PreferenceMemory:
+    answer_style: str = ""
+    language: str = ""
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass
+class StructuredSessionMemory:
+    goal: str = ""
+    current_task: str = ""
+    decisions: list[str] = field(default_factory=list)
+    artifacts: list[str] = field(default_factory=list)
+    open_questions: list[str] = field(default_factory=list)
+
+
+@dataclass
+class AssistantSessionState:
+    history: list[ChatMessage]
+    app_type: str
+    history_summary: str
+    summary_backlog: list[ChatMessage]
+    summary_backlog_user_count: int
+    preference_memory: PreferenceMemory
+    structured_memory: StructuredSessionMemory
+    session_cost: float
+    last_usage: UsageStats | None
+
+
 class AIAssistant:
     def __init__(
         self,
@@ -137,6 +168,7 @@ class AIAssistant:
         history_window_turns: int = DEFAULT_HISTORY_WINDOW_TURNS,
         history_summary_every_turns: int = DEFAULT_HISTORY_SUMMARY_EVERY_TURNS,
         history_summary_max_chars: int = DEFAULT_HISTORY_SUMMARY_MAX_CHARS,
+        search_cache_ttl_sec: int = 90,
         backend: str = DEFAULT_BACKEND,
         openai_api_key: str | None = None,
         ollama_base_url: str = OLLAMA_BASE_URL,
@@ -159,6 +191,7 @@ class AIAssistant:
         self.history_summary_max_chars = max(
             256, int(history_summary_max_chars or DEFAULT_HISTORY_SUMMARY_MAX_CHARS)
         )
+        self.search_cache_ttl_sec = max(0, int(search_cache_ttl_sec))
 
         anthro_key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
         openai_key = openai_api_key or os.environ.get("OPENAI_API_KEY", "")
@@ -185,6 +218,10 @@ class AIAssistant:
         self._app_type: str = ""
         self._ocr_active_for_turn = False
         self._history_summary: str = ""
+        self._summary_backlog: list[ChatMessage] = []
+        self._summary_backlog_user_count: int = 0
+        self._preference_memory = PreferenceMemory()
+        self._structured_memory = StructuredSessionMemory()
 
         self._session_cost: float = 0.0
         self._last_usage: UsageStats | None = None
@@ -218,8 +255,15 @@ class AIAssistant:
         app_addition = APP_PROMPTS.get(self._app_type, "")
         if app_addition:
             prompt += f"\n\n## Current context\n{app_addition}"
-        if self._history_summary:
-            prompt += f"\n\n## Session summary\n{self._history_summary}"
+        preference_text = self._render_preference_memory()
+        if preference_text:
+            prompt += f"\n\n## User preferences\n{preference_text}"
+        structured_memory = self._render_structured_memory()
+        if structured_memory:
+            prompt += f"\n\n## Working memory\n{structured_memory}"
+        session_summary = self._get_session_summary_text()
+        if session_summary:
+            prompt += f"\n\n## Session summary\n{session_summary}"
         return prompt
 
     def _get_system_payload(self) -> list[dict[str, Any]] | str:
@@ -318,18 +362,7 @@ class AIAssistant:
                 break
         return " | ".join(lines).strip()
 
-    def _update_history_summary(self, dropped_messages: list[ChatMessage]) -> None:
-        if not dropped_messages:
-            return
-        user_count = sum(1 for m in dropped_messages if m.role == "user")
-        if user_count <= 0:
-            return
-        # Refresh summary only on configured cadence to avoid excessive prompt churn.
-        existing_users = sum(1 for m in self.history if m.role == "user")
-        if (existing_users % self.history_summary_every_turns) != 0:
-            return
-
-        segment = self._summarize_messages(dropped_messages)
+    def _merge_history_summary(self, segment: str) -> None:
         if not segment:
             return
         if not self._history_summary:
@@ -339,6 +372,157 @@ class AIAssistant:
         if len(merged) > self.history_summary_max_chars:
             merged = merged[-self.history_summary_max_chars :]
         self._history_summary = merged
+
+    def _remember_preference_from_question(self, question: str) -> None:
+        lowered = question.strip().lower()
+        if not lowered:
+            return
+        if any(phrase in lowered for phrase in ("keep it short", "be concise", "brief answer", "terse")):
+            self._preference_memory.answer_style = "concise"
+        elif any(phrase in lowered for phrase in ("step by step", "give steps", "numbered steps")):
+            self._preference_memory.answer_style = "steps"
+        elif any(phrase in lowered for phrase in ("more detail", "be detailed", "go deeper")):
+            self._preference_memory.answer_style = "detailed"
+        elif any(phrase in lowered for phrase in ("plain language", "simple words", "explain simply")):
+            self._preference_memory.answer_style = "plain"
+
+        if any(phrase in lowered for phrase in ("in chinese", "reply in chinese", "中文")):
+            self._preference_memory.language = "Chinese"
+        elif any(phrase in lowered for phrase in ("in english", "reply in english", "英文")):
+            self._preference_memory.language = "English"
+
+        for phrase in ("just the answer", "no preamble", "show code", "use bullets"):
+            if phrase in lowered and phrase not in self._preference_memory.notes:
+                self._preference_memory.notes.append(phrase)
+        self._preference_memory.notes = self._preference_memory.notes[-4:]
+
+    def _append_memory_item(self, items: list[str], value: str, *, limit: int = 4) -> None:
+        value = value.strip()
+        if not value:
+            return
+        if value in items:
+            items.remove(value)
+        items.append(value)
+        del items[:-limit]
+
+    def _update_structured_memory(self, messages: list[ChatMessage]) -> None:
+        for msg in messages:
+            text = msg.text.strip().replace("\n", " ")
+            if not text:
+                continue
+            compact = text[:180]
+            lowered = compact.lower()
+            if msg.role == "user":
+                if not self._structured_memory.goal and any(
+                    phrase in lowered for phrase in ("help me", "i need", "i want", "i'm trying", "can you")
+                ):
+                    self._structured_memory.goal = compact
+                if any(
+                    phrase in lowered
+                    for phrase in ("working on", "trying to", "need to", "fix", "debug", "draft", "write")
+                ):
+                    self._structured_memory.current_task = compact
+                if compact.endswith("?"):
+                    self._append_memory_item(self._structured_memory.open_questions, compact, limit=5)
+            else:
+                if any(phrase in lowered for phrase in ("use ", "set ", "keep ", "try ", "next ", "recommend")):
+                    self._append_memory_item(self._structured_memory.decisions, compact, limit=5)
+
+            for match in _ARTIFACT_PATTERN.findall(compact):
+                self._append_memory_item(self._structured_memory.artifacts, match, limit=6)
+
+    def _render_preference_memory(self) -> str:
+        lines: list[str] = []
+        if self._preference_memory.answer_style:
+            lines.append(f"- answer_style: {self._preference_memory.answer_style}")
+        if self._preference_memory.language:
+            lines.append(f"- preferred_language: {self._preference_memory.language}")
+        for note in self._preference_memory.notes:
+            lines.append(f"- note: {note}")
+        return "\n".join(lines).strip()
+
+    def _render_structured_memory(self) -> str:
+        lines: list[str] = []
+        if self._structured_memory.goal:
+            lines.append(f"- goal: {self._structured_memory.goal}")
+        if self._structured_memory.current_task:
+            lines.append(f"- current_task: {self._structured_memory.current_task}")
+        if self._structured_memory.decisions:
+            lines.append(f"- decisions: {' | '.join(self._structured_memory.decisions[-3:])}")
+        if self._structured_memory.artifacts:
+            lines.append(f"- artifacts: {' | '.join(self._structured_memory.artifacts[-4:])}")
+        if self._structured_memory.open_questions:
+            lines.append(f"- open_questions: {' | '.join(self._structured_memory.open_questions[-3:])}")
+        return "\n".join(lines).strip()
+
+    def _get_session_summary_text(self) -> str:
+        parts: list[str] = []
+        if self._history_summary:
+            parts.append(self._history_summary)
+        if self._summary_backlog:
+            pending = self._summarize_messages(self._summary_backlog)
+            if pending:
+                parts.append(pending)
+        merged = " | ".join(parts).strip()
+        if len(merged) > self.history_summary_max_chars:
+            merged = merged[-self.history_summary_max_chars :]
+        return merged
+
+    def _update_history_summary(self, dropped_messages: list[ChatMessage]) -> None:
+        if not dropped_messages:
+            return
+        user_count = sum(1 for m in dropped_messages if m.role == "user")
+        if user_count <= 0:
+            return
+        self._update_structured_memory(dropped_messages)
+        self._summary_backlog.extend(dropped_messages)
+        self._summary_backlog_user_count += user_count
+        # Keep newly trimmed turns visible immediately through the backlog summary,
+        # but only merge them into the stable summary on the configured cadence.
+        if self._summary_backlog_user_count < self.history_summary_every_turns:
+            return
+
+        segment = self._summarize_messages(self._summary_backlog)
+        if segment:
+            self._merge_history_summary(segment)
+        self._summary_backlog = []
+        self._summary_backlog_user_count = 0
+
+    def _inject_text_context_into_latest_user_message(
+        self,
+        messages: list[dict[str, Any]],
+        *context_blocks: str,
+    ) -> None:
+        extra_blocks = [block.strip() for block in context_blocks if block and block.strip()]
+        if not extra_blocks:
+            return
+
+        for msg in reversed(messages):
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                msg["content"] = "\n\n".join(extra_blocks + [content])
+                return
+            if not isinstance(content, list):
+                return
+
+            insert_at = len(content)
+            for idx in range(len(content) - 1, -1, -1):
+                if content[idx].get("type") == "text":
+                    insert_at = idx
+                    break
+            blocks = [{"type": "text", "text": block} for block in extra_blocks]
+            content[insert_at:insert_at] = blocks
+            return
+
+    def _build_direct_search_context(self, query: str) -> str:
+        query = query.strip()
+        if not query:
+            return ""
+        results = search(query, cache_ttl_sec=self.search_cache_ttl_sec)
+        logger.info("Direct search context: query='%s' results=%d", query, len(results))
+        return f"[Web search results]\n{format_results(results)}"
 
     def _build_messages(self, *, include_images: bool = True) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
@@ -435,7 +619,7 @@ class AIAssistant:
                 if call.name != "web_search":
                     continue
                 query = str(call.input.get("query", "")).strip()
-                results = search(query)
+                results = search(query, cache_ttl_sec=self.search_cache_ttl_sec)
                 assistant_tool_blocks.append(
                     {
                         "type": "tool_use",
@@ -480,34 +664,42 @@ class AIAssistant:
         search_hint_question: str | None = None,
         force_search_tool: bool = False,
         ocr_text: str = "",
+        max_tokens_override: int | None = None,
     ) -> str:
         self._ocr_active_for_turn = bool(ocr_text.strip())
+        self._remember_preference_from_question(question)
+        self._update_structured_memory([ChatMessage(role="user", text=question)])
         self.history.append(ChatMessage(role="user", text=question, image=image))
         self._trim_history()
 
-        include_search_tool = (
-            self.backend.supports_tools
-            and (force_search_tool or self._should_include_search(search_hint_question or question))
-        )
+        search_requested = force_search_tool or self._should_include_search(search_hint_question or question)
+        include_search_tool = self.backend.supports_tools and search_requested
         turn_usage = {"input": 0, "output": 0, "cached": 0}
+        request_max_tokens = max(1, int(max_tokens_override or self.max_tokens))
+        direct_search_augmentation = bool(
+            getattr(getattr(self.backend, "capabilities", None), "direct_search_augmentation", True)
+        )
 
         try:
             messages = self._build_messages(include_images=self.backend.supports_vision)
             if image is not None and not self.backend.supports_vision:
                 logger.info("Backend '%s' does not support vision; dropping image.", self.backend_name)
+            if search_requested and direct_search_augmentation:
+                direct_search_context = self._build_direct_search_context(search_hint_question or question)
+                self._inject_text_context_into_latest_user_message(messages, direct_search_context)
 
             logger.info(
                 "Sending request (backend=%s, model=%s, max_tokens=%d, history=%d, tools=%s)",
                 self.backend_name,
                 self.model,
-                self.max_tokens,
+                request_max_tokens,
                 len(self.history),
                 "web_search" if include_search_tool else "none",
             )
 
             response = self.backend.chat(
                 messages=messages,
-                max_tokens=self.max_tokens,
+                max_tokens=request_max_tokens,
                 system=self._get_system_payload(),
                 tools=[SEARCH_TOOL] if include_search_tool else None,
             )
@@ -537,6 +729,10 @@ class AIAssistant:
     def clear_history(self):
         self.history.clear()
         self._history_summary = ""
+        self._summary_backlog = []
+        self._summary_backlog_user_count = 0
+        self._preference_memory = PreferenceMemory()
+        self._structured_memory = StructuredSessionMemory()
 
     def spawn_with_overrides(
         self,
@@ -555,7 +751,35 @@ class AIAssistant:
             history_window_turns=self.history_window_turns,
             history_summary_every_turns=self.history_summary_every_turns,
             history_summary_max_chars=self.history_summary_max_chars,
+            search_cache_ttl_sec=self.search_cache_ttl_sec,
             ollama_base_url=self._ollama_base_url,
             openai_base_url=self._openai_base_url,
             backend_timeout_sec=self._backend_timeout_sec,
         )
+
+    def snapshot_session_state(self) -> AssistantSessionState:
+        history = [copy.deepcopy(msg) for msg in self.history]
+        backlog = [copy.deepcopy(msg) for msg in self._summary_backlog]
+        last_usage = copy.deepcopy(self._last_usage)
+        return AssistantSessionState(
+            history=history,
+            app_type=self._app_type,
+            history_summary=self._history_summary,
+            summary_backlog=backlog,
+            summary_backlog_user_count=self._summary_backlog_user_count,
+            preference_memory=copy.deepcopy(self._preference_memory),
+            structured_memory=copy.deepcopy(self._structured_memory),
+            session_cost=self._session_cost,
+            last_usage=last_usage,
+        )
+
+    def restore_session_state(self, state: AssistantSessionState) -> None:
+        self.history = [copy.deepcopy(msg) for msg in state.history]
+        self._app_type = state.app_type
+        self._history_summary = state.history_summary
+        self._summary_backlog = [copy.deepcopy(msg) for msg in state.summary_backlog]
+        self._summary_backlog_user_count = state.summary_backlog_user_count
+        self._preference_memory = copy.deepcopy(state.preference_memory)
+        self._structured_memory = copy.deepcopy(state.structured_memory)
+        self._session_cost = float(state.session_cost)
+        self._last_usage = copy.deepcopy(state.last_usage)

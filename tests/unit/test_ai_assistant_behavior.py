@@ -8,6 +8,7 @@ import anthropic
 from PIL import Image
 
 from src.ai_assistant import AIAssistant, ChatMessage, SEARCH_TOOL
+from src.backends import BackendResponse
 
 
 class _Block:
@@ -36,6 +37,24 @@ class _MessagesAPI:
 class _Client:
     def __init__(self, responses):
         self.messages = _MessagesAPI(responses)
+
+
+class _BackendSpy:
+    supports_tools = False
+    supports_vision = False
+    backend_name = "openai"
+    model = "gpt-4o-mini"
+
+    def __init__(self, text: str = "ok"):
+        self.calls = []
+        self._text = text
+
+    def chat(self, **kwargs):
+        self.calls.append(kwargs)
+        return BackendResponse(text=self._text, stop_reason="end_turn", tool_calls=[])
+
+    def validate(self):
+        return True, ""
 
 
 def test_non_tool_response_joins_all_text_blocks():
@@ -128,3 +147,61 @@ def test_history_summary_added_to_system_prompt_after_trim():
     prompt = ai._get_full_system_prompt()
     assert "Session summary" in prompt
     assert "old user" in prompt.lower()
+
+
+def test_history_summary_backlog_surfaces_trimmed_turns_before_flush():
+    ai = AIAssistant(
+        api_key="sk-test",
+        history_window_turns=2,
+        history_summary_every_turns=2,
+        history_summary_max_chars=600,
+    )
+
+    for idx in range(4):
+        ai.history.append(ChatMessage(role="user", text=f"user {idx}"))
+        ai.history.append(ChatMessage(role="assistant", text=f"assistant {idx}"))
+        ai._trim_history()
+
+    prompt = ai._get_full_system_prompt().lower()
+    assert "session summary" in prompt
+    assert "user 0" in prompt
+    assert "user 1" in prompt
+
+
+def test_non_tool_backend_injects_direct_search_context(monkeypatch):
+    ai = AIAssistant(api_key="sk-test")
+    backend = _BackendSpy(text="searched")
+    ai.backend = backend
+    ai.backend_name = backend.backend_name
+    ai.model = backend.model
+
+    monkeypatch.setattr(
+        "src.ai_assistant.search",
+        lambda query, cache_ttl_sec=90: [{"title": query, "url": "https://x", "snippet": "snippet"}],
+    )
+    monkeypatch.setattr("src.ai_assistant.format_results", lambda results: "SEARCH_RESULT_BLOCK")
+
+    answer = ai.ask("What is the latest Python release today?")
+
+    assert answer == "searched"
+    sent_messages = backend.calls[0]["messages"]
+    latest_user = sent_messages[-1]
+    text_blocks = [block["text"] for block in latest_user["content"] if block.get("type") == "text"]
+    assert any("[Web search results]" in block for block in text_blocks)
+    assert any("SEARCH_RESULT_BLOCK" in block for block in text_blocks)
+
+
+def test_preference_and_structured_memory_render_in_system_prompt():
+    ai = AIAssistant(api_key="sk-test")
+    backend = _BackendSpy(text="ok")
+    ai.backend = backend
+    ai.backend_name = backend.backend_name
+    ai.model = backend.model
+
+    ai.ask("Please give steps in Chinese to fix src/main.py and keep it short.")
+
+    system_text = backend.calls[0]["system"]
+    assert "answer_style: concise" in system_text
+    assert "preferred_language: Chinese" in system_text
+    assert "current_task:" in system_text
+    assert "artifacts:" in system_text

@@ -188,9 +188,12 @@ Use `config.json`:
   "context_reference_refresh_turns": 3,
   "url_cache_ttl_sec": 300,
   "ocr_cache_ttl_sec": 300,
+  "search_cache_ttl_sec": 90,
   "context_telemetry": true,
   "tray_mode": false,
   "show_token_cost": false,
+  "adaptive_output_caps": true,
+  "session_recovery_ttl_sec": 120,
   "enable_ocr_fallback": false,
   "ocr_max_chars": 3000,
   "ocr_timeout_sec": 5,
@@ -244,17 +247,42 @@ Additional config notes:
 - `allow_private_url_browse`: allows or blocks localhost/private-network URLs in direct URL browse mode.
 - `context_max_chars`: character budget used for token-aware context packing before each ask.
 - `context_reference_refresh_turns`: how often static context is resent in full vs reference-only.
-- `url_cache_ttl_sec` / `ocr_cache_ttl_sec`: cache TTLs for URL fetch and OCR reuse.
+- `url_cache_ttl_sec` / `ocr_cache_ttl_sec` / `search_cache_ttl_sec`: cache TTLs for URL fetch, OCR reuse, and short-term web search reuse.
 - `context_telemetry`: enables per-turn context token estimate logging by block.
 - `tray_mode`: hide pet to system tray between interactions.
 - `show_token_cost`: display per-turn and session token cost estimate in the overlay.
+- `adaptive_output_caps`: shrink or expand reply caps by turn type instead of always using the same `max_tokens`.
+- `session_recovery_ttl_sec`: how long a dismissed reply/draft stays recoverable on the next manual activation.
 - `enable_ocr_fallback`: optional local OCR extraction for text-heavy app contexts.
 - `tesseract_cmd`: optional absolute path to `tesseract.exe`; if empty, BuddyGPT checks common Windows paths and PATH.
 
 UX notes:
 - Press `Esc` while BuddyGPT is thinking to cancel the current request.
+- Each turn lets you toggle `Use screenshot`, `Use clipboard`, `Use URLs`, and `Use OCR` before sending.
+- If you dismiss BuddyGPT accidentally, the most recent reply/draft can be restored on the next manual wake within the recovery TTL.
 - Reply quick actions are available after each answer: `Explain simpler`, `Give steps`, and `Copy answer`.
 - In tray mode, you can `Snooze Hints 1h` or `Resume Hints` from the tray menu.
+
+## Windows Smoke Checks
+
+Run the local smoke harness before packaging or after dependency changes:
+
+```powershell
+python scripts/windows_smoke.py
+```
+
+Useful variants:
+
+```powershell
+python scripts/windows_smoke.py --checks hotkey clipboard tray
+python scripts/windows_smoke.py --json
+```
+
+What it covers:
+- hotkey callback wiring
+- clipboard capture/readback
+- OCR availability + basic extraction
+- tray icon construction
 
 Installed app config location:
 - `%APPDATA%\BuddyGPT\config.json`

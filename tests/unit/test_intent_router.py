@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from src.intent_router import classify_response_mode
 from src.interaction_mode import ResponseMode
 
@@ -11,6 +13,16 @@ class DummyAI:
 
     client = None
     model = "dummy"
+
+
+class _BackendClassifierAI:
+    model = "gpt-4o-mini"
+    client = None
+
+    def __init__(self, text: str):
+        self.backend = SimpleNamespace(
+            chat=lambda **_kwargs: SimpleNamespace(text=text),
+        )
 
 
 def test_work_app_neutral_text_defaults_work():
@@ -45,6 +57,15 @@ def test_ambiguous_text_uses_model_fallback(monkeypatch):
         ai=DummyAI(),
     )
     assert called["v"] is True
+    assert mode == ResponseMode.CASUAL
+
+
+def test_ambiguous_text_uses_backend_chat_fallback_for_non_anthropic():
+    mode = classify_response_mode(
+        question="ok",
+        app_type="browser",
+        ai=_BackendClassifierAI("casual"),
+    )
     assert mode == ResponseMode.CASUAL
 
 

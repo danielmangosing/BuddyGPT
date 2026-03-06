@@ -7,6 +7,7 @@ import tkinter.font as tkfont
 
 from PIL import Image, ImageTk
 
+from .context_state import ContextAvailability, ContextControls, RecoveryViewState
 from .interaction_mode import AssistantTurnResult, ResponseMode
 from .pet import Pet, PetState
 from .sprites import SpriteManager
@@ -47,6 +48,7 @@ BUBBLE_MAX_TEXT_H = 280
 INPUT_H = 34
 INPUT_R = 17
 INPUT_PAD_X = 28
+CONTROL_ROW_H = 30
 
 BASE_H = SPRITE_SIZE + 50
 INPUT_AREA_H = INPUT_H + 16
@@ -99,12 +101,14 @@ class OverlayWindow:
         self,
         on_submit,
         on_activate=None,
+        on_dismiss=None,
         tray_mode: bool = False,
         show_token_cost: bool = False,
         usage_provider=None,
     ):
         self._on_submit = on_submit
         self._on_activate = on_activate
+        self._on_dismiss = on_dismiss
         self._tray_mode = tray_mode
         self._show_token_cost = show_token_cost
         self._usage_provider = usage_provider
@@ -128,7 +132,10 @@ class OverlayWindow:
         self._request_counter = 0
         self._active_request_id = 0
         self._last_answer_text = ""
+        self._last_response_mode = ResponseMode.WORK
         self._alert_dismiss_ms = ALERT_DISMISS_MS
+        self._context_availability = ContextAvailability()
+        self._context_controls = ContextControls()
 
         self._pet.on_state_change(
             lambda old, new: self._root.after(0, self._on_pet_state_change)
@@ -278,6 +285,38 @@ class OverlayWindow:
         self._quick_simple_btn.pack(side=tk.LEFT, padx=3)
         self._quick_steps_btn.pack(side=tk.LEFT, padx=3)
         self._quick_copy_btn.pack(side=tk.LEFT, padx=3)
+
+        self._context_row = tk.Frame(self._frame, bg=CHROMA)
+        self._context_vars = {
+            "screenshot": tk.BooleanVar(value=True),
+            "clipboard": tk.BooleanVar(value=False),
+            "urls": tk.BooleanVar(value=True),
+            "ocr": tk.BooleanVar(value=False),
+        }
+        self._context_buttons: dict[str, tk.Checkbutton] = {}
+        for key, label in (
+            ("screenshot", "Use screenshot"),
+            ("clipboard", "Use clipboard"),
+            ("urls", "Use URLs"),
+            ("ocr", "Use OCR"),
+        ):
+            btn = tk.Checkbutton(
+                self._context_row,
+                text=label,
+                variable=self._context_vars[key],
+                bg=CHROMA,
+                fg=BUBBLE_FG,
+                activebackground=CHROMA,
+                activeforeground=BUBBLE_FG,
+                selectcolor=BUBBLE_BG,
+                relief=tk.FLAT,
+                font=("Segoe UI", 8),
+                borderwidth=0,
+                highlightthickness=0,
+                command=self._on_context_control_changed,
+            )
+            btn.pack(side=tk.LEFT, padx=2)
+            self._context_buttons[key] = btn
 
         self._input_canvas = tk.Canvas(
             self._frame,
@@ -473,6 +512,8 @@ class OverlayWindow:
             new_h += bubble_h + 8
         if with_input:
             new_h += INPUT_AREA_H
+            if self._context_row.winfo_ismapped():
+                new_h += CONTROL_ROW_H
 
         self._root.geometry(f"{WINDOW_W}x{new_h}+{x}+{bottom - new_h}")
 
@@ -514,6 +555,7 @@ class OverlayWindow:
             self._hide_cost_label()
             self._hide_quick_actions()
             self._bubble_canvas.pack_forget()
+            self._hide_context_controls()
             self._input_canvas.pack_forget()
             self._root.geometry(f"{WINDOW_W}x{H_RESTING}+{x}+{bottom - H_RESTING}")
             self._update_status("zzZ")
@@ -523,6 +565,7 @@ class OverlayWindow:
             self._cancel_auto_rest()
             self._hide_cost_label()
             self._hide_quick_actions()
+            self._hide_context_controls()
             self._input_canvas.pack_forget()
             self._schedule_alert_dismiss()
             return
@@ -531,6 +574,7 @@ class OverlayWindow:
             self._cancel_auto_rest()
             self._hide_cost_label()
             self._hide_quick_actions()
+            self._show_context_controls()
             self._input_canvas.pack(pady=(4, 8))
             if self._bubble_total_h > 0:
                 self._set_window_height(bubble_h=self._bubble_total_h, with_input=True)
@@ -542,6 +586,7 @@ class OverlayWindow:
             self._hide_cost_label()
             self._hide_quick_actions()
             self._bubble_canvas.pack_forget()
+            self._show_context_controls()
             self._input_canvas.pack(pady=(4, 8))
             self._root.geometry(f"{WINDOW_W}x{H_AWAKE}+{x}+{bottom - H_AWAKE}")
             self._entry.delete(0, tk.END)
@@ -555,6 +600,7 @@ class OverlayWindow:
             self._cancel_auto_rest()
             self._hide_cost_label()
             self._hide_quick_actions()
+            self._hide_context_controls()
             self._input_canvas.pack_forget()
             bubble_h = self._update_bubble("Thinking... (Esc cancel)")
             self._set_window_height(bubble_h=bubble_h)
@@ -564,10 +610,12 @@ class OverlayWindow:
         if state == PetState.REPLY:
             self._update_status("Ask more, or Esc to close")
             self._show_quick_actions()
+            self._show_context_controls()
             return
 
         if state == PetState.IDLE_CHAT:
             self._cancel_auto_rest()
+            self._show_context_controls()
             self._input_canvas.pack(pady=(4, 8))
             if self._bubble_total_h > 0:
                 self._set_window_height(bubble_h=self._bubble_total_h, with_input=True)
@@ -603,6 +651,14 @@ class OverlayWindow:
         self._bubble_text.config(state=tk.NORMAL)
         self._bubble_text.delete("1.0", tk.END)
         self._bubble_text.config(state=tk.DISABLED)
+        self._set_context_availability(
+            ContextAvailability(
+                screenshot=self._image is not None,
+                clipboard=False,
+                urls=True,
+                ocr=self._image is not None,
+            )
+        )
         self._root.deiconify()
         self._root.focus_force()
 
@@ -618,6 +674,14 @@ class OverlayWindow:
         self._root.focus_force()
         self._hide_cost_label()
         self._hide_quick_actions()
+        self._set_context_availability(
+            ContextAvailability(
+                screenshot=False,
+                clipboard=False,
+                urls=True,
+                ocr=False,
+            )
+        )
 
         if self._pet.state == PetState.RESTING:
             if pet_state == PetState.GREETING:
@@ -682,6 +746,11 @@ class OverlayWindow:
             self._alert_after_id = None
 
     def _dismiss(self):
+        if self._on_dismiss:
+            try:
+                self._on_dismiss(self.get_view_state())
+            except Exception:
+                pass
         self._cancel_event.set()
         self._active_request_id += 1
         self._cancel_auto_rest()
@@ -690,6 +759,7 @@ class OverlayWindow:
         self._pet.trigger("dismiss")
         self._hide_cost_label()
         self._hide_quick_actions()
+        self._hide_context_controls()
         if self._tray_mode and self._root:
             self._root.after(300, self._root.withdraw)
 
@@ -704,18 +774,30 @@ class OverlayWindow:
         self._request_counter += 1
         self._active_request_id = self._request_counter
         request_id = self._active_request_id
+        controls = self.get_context_controls()
 
         self._cancel_auto_rest()
         self._entry.delete(0, tk.END)
         self._entry.config(state=tk.DISABLED)
         self._send_btn.config(state=tk.DISABLED)
+        for btn in self._context_buttons.values():
+            btn.config(state=tk.DISABLED)
         self._set_quick_actions_enabled(False)
         self._pet.trigger("submit")
-        threading.Thread(target=self._ask_async, args=(question, request_id), daemon=True).start()
+        threading.Thread(
+            target=self._ask_async,
+            args=(question, request_id, controls),
+            daemon=True,
+        ).start()
 
-    def _ask_async(self, question, request_id: int):
+    def _ask_async(self, question, request_id: int, controls: ContextControls):
         try:
-            answer = self._on_submit(question, self._image, cancel_token=self._cancel_event)
+            answer = self._on_submit(
+                question,
+                self._image,
+                cancel_token=self._cancel_event,
+                controls=controls,
+            )
             self._image = None
             self._root.after(0, lambda: self._show_answer_if_current(request_id, answer))
         except Exception as exc:
@@ -731,6 +813,7 @@ class OverlayWindow:
         self._pet.trigger(reply_event)
         self._chat_mode = response_mode == ResponseMode.CASUAL
         self._last_answer_text = answer_text
+        self._last_response_mode = response_mode
         self._set_quick_actions_enabled(True)
 
         hint = "Esc close - Enter follow-up"
@@ -743,6 +826,12 @@ class OverlayWindow:
         self._entry.delete(0, tk.END)
         self._entry.config(state=tk.NORMAL)
         self._send_btn.config(state=tk.NORMAL)
+        for key, btn in self._context_buttons.items():
+            btn.config(
+                state=tk.NORMAL
+                if getattr(self._context_availability, key if key != "urls" else "urls")
+                else tk.DISABLED
+            )
 
         self._set_window_height(bubble_h=bubble_h, with_input=True)
         self._root.after(100, lambda: self._entry.focus_set())
@@ -841,3 +930,137 @@ class OverlayWindow:
             self._update_status("Copied")
         except Exception:
             self._update_status("Copy failed")
+
+    def _show_context_controls(self):
+        if any(
+            (
+                self._context_availability.screenshot,
+                self._context_availability.clipboard,
+                self._context_availability.urls,
+                self._context_availability.ocr,
+            )
+        ):
+            if not self._context_row.winfo_ismapped():
+                self._context_row.pack(pady=(0, 4), before=self._input_canvas)
+
+    def _hide_context_controls(self):
+        self._context_row.pack_forget()
+
+    def _on_context_control_changed(self):
+        if self._bubble_total_h > 0 and self._input_canvas.winfo_ismapped():
+            self._set_window_height(bubble_h=self._bubble_total_h, with_input=True)
+
+    def _set_context_availability(
+        self,
+        availability: ContextAvailability,
+        controls: ContextControls | None = None,
+    ):
+        self._context_availability = availability
+        next_controls = controls or availability.default_controls()
+        self._context_controls = next_controls
+        values = {
+            "screenshot": availability.screenshot and next_controls.screenshot,
+            "clipboard": availability.clipboard and next_controls.clipboard,
+            "urls": availability.urls and next_controls.urls,
+            "ocr": availability.ocr and next_controls.ocr,
+        }
+        for key, value in values.items():
+            self._context_vars[key].set(bool(value))
+            self._context_buttons[key].config(
+                state=tk.NORMAL if getattr(availability, key if key != "urls" else "urls") else tk.DISABLED
+            )
+
+    def set_context_availability(
+        self,
+        availability: ContextAvailability,
+        controls: ContextControls | None = None,
+    ):
+        if self._root:
+            self._root.after(0, lambda: self._set_context_availability(availability, controls))
+
+    def get_context_controls(self) -> ContextControls:
+        return ContextControls(
+            screenshot=bool(self._context_vars["screenshot"].get()),
+            clipboard=bool(self._context_vars["clipboard"].get()),
+            urls=bool(self._context_vars["urls"].get()),
+            ocr=bool(self._context_vars["ocr"].get()),
+        )
+
+    def get_view_state(self) -> RecoveryViewState:
+        draft_text = self._entry.get().strip() if self._entry else ""
+        answer_text = self._last_answer_text
+        return RecoveryViewState(
+            answer_text=answer_text,
+            draft_text=draft_text,
+            response_mode=self._last_response_mode,
+            controls=self.get_context_controls(),
+            availability=self._context_availability,
+        )
+
+    def restore_session(
+        self,
+        *,
+        answer_text: str,
+        draft_text: str,
+        response_mode: ResponseMode,
+        controls: ContextControls,
+        availability: ContextAvailability,
+        image=None,
+        window_title: str = "BuddyGPT (Recovered)",
+    ):
+        if self._root:
+            self._root.after(
+                0,
+                lambda: self._do_restore_session(
+                    answer_text=answer_text,
+                    draft_text=draft_text,
+                    response_mode=response_mode,
+                    controls=controls,
+                    availability=availability,
+                    image=image,
+                    window_title=window_title,
+                ),
+            )
+
+    def _do_restore_session(
+        self,
+        *,
+        answer_text: str,
+        draft_text: str,
+        response_mode: ResponseMode,
+        controls: ContextControls,
+        availability: ContextAvailability,
+        image,
+        window_title: str,
+    ):
+        self._window_title = window_title
+        self._image = image
+        self._cancel_event.clear()
+        self._root.deiconify()
+        self._root.focus_force()
+        self._hide_cost_label()
+        self._set_context_availability(availability, controls)
+        if self._pet.state != PetState.RESTING:
+            self._pet.trigger("dismiss")
+        self._pet.trigger("activate")
+        self._pet.trigger("submit")
+        self._pet.trigger("chat_answer" if response_mode == ResponseMode.CASUAL else "answer")
+        self._chat_mode = response_mode == ResponseMode.CASUAL
+        self._last_response_mode = response_mode
+        self._last_answer_text = answer_text
+        self._set_quick_actions_enabled(True)
+        self._show_quick_actions()
+        self._show_context_controls()
+        hint = "Recovered session - Enter continue"
+        bubble_h = self._update_bubble(answer_text, hint=hint)
+        self._input_canvas.pack(pady=(4, 8))
+        self._entry.config(state=tk.NORMAL)
+        self._send_btn.config(state=tk.NORMAL)
+        self._entry.delete(0, tk.END)
+        if draft_text:
+            self._entry.insert(0, draft_text)
+        self._update_status("Recovered session")
+        self._update_cost_label()
+        self._set_window_height(bubble_h=bubble_h, with_input=True)
+        self._root.after(100, lambda: self._entry.focus_set())
+        self._schedule_auto_rest()

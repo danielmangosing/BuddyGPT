@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import logging
+import time
 from types import SimpleNamespace
 
 import main as main_mod
+import src.turn_pipeline as turn_pipeline_mod
+from PIL import Image
+from src.context_state import ContextAvailability, ContextControls, RecoveryViewState
 from src.interaction_mode import ResponseMode
+from src.recovery import SessionRecoverySnapshot
 from src.url_browse import FetchedPage
 
 
@@ -14,6 +19,7 @@ class _FakeAI:
     def __init__(self, answer: str = "ok"):
         self.answer = answer
         self.calls: list[dict] = []
+        self.max_tokens = 400
 
     def ask(self, question: str, image=None, **kwargs):
         self.calls.append({"question": question, "image": image, **kwargs})
@@ -27,8 +33,8 @@ def test_on_submit_continues_when_some_urls_fail(monkeypatch):
     monkeypatch.setattr(rt, "onboarding_needed", False)
     monkeypatch.setattr(rt, "target_hwnd", 0)
     monkeypatch.setattr(rt, "current_app", None)
-    monkeypatch.setattr(main_mod, "classify_response_mode", lambda **_kwargs: ResponseMode.WORK)
-    monkeypatch.setattr(main_mod, "extract_urls", lambda _text: ["https://ok", "https://bad"])
+    monkeypatch.setattr(turn_pipeline_mod, "classify_response_mode", lambda **_kwargs: ResponseMode.WORK)
+    monkeypatch.setattr(turn_pipeline_mod, "extract_urls", lambda _text: ["https://ok", "https://bad"])
     monkeypatch.setitem(main_mod.cfg, "allow_private_url_browse", True)
 
     def _fake_fetch(url, timeout_sec, max_bytes, allow_private=True):
@@ -42,8 +48,12 @@ def test_on_submit_continues_when_some_urls_fail(monkeypatch):
             )
         return FetchedPage(url=url, ok=False, error="timeout")
 
-    monkeypatch.setattr(main_mod, "fetch_public_page", _fake_fetch)
-    monkeypatch.setattr(main_mod, "build_browse_context", lambda **_kwargs: "BROWSE_CTX")
+    monkeypatch.setattr(turn_pipeline_mod, "fetch_public_page", _fake_fetch)
+    monkeypatch.setattr(
+        turn_pipeline_mod.TurnPipeline,
+        "_build_cached_browse_context",
+        lambda self, runtime, settings, pages: "BROWSE_CTX",
+    )
 
     result = main_mod.on_submit("Please check these links", image=None)
 
@@ -64,11 +74,11 @@ def test_on_submit_returns_error_when_all_urls_fail(monkeypatch):
     monkeypatch.setattr(rt, "onboarding_needed", False)
     monkeypatch.setattr(rt, "target_hwnd", 0)
     monkeypatch.setattr(rt, "current_app", None)
-    monkeypatch.setattr(main_mod, "classify_response_mode", lambda **_kwargs: ResponseMode.WORK)
-    monkeypatch.setattr(main_mod, "extract_urls", lambda _text: ["https://bad"])
+    monkeypatch.setattr(turn_pipeline_mod, "classify_response_mode", lambda **_kwargs: ResponseMode.WORK)
+    monkeypatch.setattr(turn_pipeline_mod, "extract_urls", lambda _text: ["https://bad"])
     monkeypatch.setitem(main_mod.cfg, "allow_private_url_browse", True)
     monkeypatch.setattr(
-        main_mod,
+        turn_pipeline_mod,
         "fetch_public_page",
         lambda **_kwargs: FetchedPage(url="https://bad", ok=False, error="timeout"),
     )
@@ -305,11 +315,11 @@ def test_on_submit_updates_thinking_status_for_url_and_thinking(monkeypatch):
     monkeypatch.setattr(rt, "onboarding_needed", False)
     monkeypatch.setattr(rt, "target_hwnd", 0)
     monkeypatch.setattr(rt, "current_app", None)
-    monkeypatch.setattr(main_mod, "classify_response_mode", lambda **_kwargs: ResponseMode.WORK)
-    monkeypatch.setattr(main_mod, "extract_urls", lambda _text: ["https://ok"])
-    monkeypatch.setattr(main_mod, "should_use_ocr", lambda **_kwargs: False)
+    monkeypatch.setattr(turn_pipeline_mod, "classify_response_mode", lambda **_kwargs: ResponseMode.WORK)
+    monkeypatch.setattr(turn_pipeline_mod, "extract_urls", lambda _text: ["https://ok"])
+    monkeypatch.setattr(turn_pipeline_mod, "should_use_ocr", lambda **_kwargs: False)
     monkeypatch.setattr(
-        main_mod,
+        turn_pipeline_mod,
         "fetch_public_page",
         lambda **_kwargs: FetchedPage(
             url="https://ok",
@@ -319,7 +329,11 @@ def test_on_submit_updates_thinking_status_for_url_and_thinking(monkeypatch):
             content_type="text/html",
         ),
     )
-    monkeypatch.setattr(main_mod, "build_browse_context", lambda **_kwargs: "CTX")
+    monkeypatch.setattr(
+        turn_pipeline_mod.TurnPipeline,
+        "_build_cached_browse_context",
+        lambda self, runtime, settings, pages: "CTX",
+    )
 
     result = main_mod.on_submit("check https://ok", image=None)
     assert result.text == "ok"
@@ -341,12 +355,13 @@ def test_on_submit_updates_thinking_status_for_ocr(monkeypatch):
     monkeypatch.setattr(rt, "onboarding_needed", False)
     monkeypatch.setattr(rt, "target_hwnd", 0)
     monkeypatch.setattr(rt, "current_app", None)
-    monkeypatch.setattr(main_mod, "classify_response_mode", lambda **_kwargs: ResponseMode.WORK)
-    monkeypatch.setattr(main_mod, "extract_urls", lambda _text: [])
-    monkeypatch.setattr(main_mod, "should_use_ocr", lambda **_kwargs: True)
-    monkeypatch.setattr(main_mod, "extract_ocr_text", lambda *_args, **_kwargs: "ocr result")
+    monkeypatch.setattr(turn_pipeline_mod, "classify_response_mode", lambda **_kwargs: ResponseMode.WORK)
+    monkeypatch.setattr(turn_pipeline_mod, "extract_urls", lambda _text: [])
+    monkeypatch.setattr(turn_pipeline_mod, "should_use_ocr", lambda **_kwargs: True)
+    monkeypatch.setattr(turn_pipeline_mod, "extract_ocr_text", lambda *_args, **_kwargs: "ocr result")
+    monkeypatch.setitem(main_mod.cfg, "enable_ocr_fallback", True)
 
-    result = main_mod.on_submit("summarize this", image=object())
+    result = main_mod.on_submit("summarize this", image=Image.new("RGB", (4, 4)))
     assert result.text == "ok"
     assert "Running OCR..." in statuses
 
@@ -363,8 +378,8 @@ def test_on_submit_honors_cancel_token(monkeypatch):
     monkeypatch.setattr(rt, "onboarding_needed", False)
     monkeypatch.setattr(rt, "target_hwnd", 0)
     monkeypatch.setattr(rt, "current_app", None)
-    monkeypatch.setattr(main_mod, "classify_response_mode", lambda **_kwargs: ResponseMode.WORK)
-    monkeypatch.setattr(main_mod, "extract_urls", lambda _text: [])
+    monkeypatch.setattr(turn_pipeline_mod, "classify_response_mode", lambda **_kwargs: ResponseMode.WORK)
+    monkeypatch.setattr(turn_pipeline_mod, "extract_urls", lambda _text: [])
 
     result = main_mod.on_submit("cancel me", image=None, cancel_token=_Token())
     assert "cancelled" in result.text.lower()
@@ -381,8 +396,8 @@ def test_on_submit_reuses_url_cache(monkeypatch):
     monkeypatch.setattr(rt, "onboarding_needed", False)
     monkeypatch.setattr(rt, "target_hwnd", 0)
     monkeypatch.setattr(rt, "current_app", None)
-    monkeypatch.setattr(main_mod, "classify_response_mode", lambda **_kwargs: ResponseMode.WORK)
-    monkeypatch.setattr(main_mod, "extract_urls", lambda _text: ["https://cache-me"])
+    monkeypatch.setattr(turn_pipeline_mod, "classify_response_mode", lambda **_kwargs: ResponseMode.WORK)
+    monkeypatch.setattr(turn_pipeline_mod, "extract_urls", lambda _text: ["https://cache-me"])
     monkeypatch.setitem(main_mod.cfg, "allow_private_url_browse", True)
     monkeypatch.setitem(main_mod.cfg, "url_cache_ttl_sec", 600)
 
@@ -396,8 +411,12 @@ def test_on_submit_reuses_url_cache(monkeypatch):
             content_type="text/html",
         )
 
-    monkeypatch.setattr(main_mod, "fetch_public_page", _fake_fetch)
-    monkeypatch.setattr(main_mod, "build_browse_context", lambda **_kwargs: "CTX")
+    monkeypatch.setattr(turn_pipeline_mod, "fetch_public_page", _fake_fetch)
+    monkeypatch.setattr(
+        turn_pipeline_mod.TurnPipeline,
+        "_build_cached_browse_context",
+        lambda self, runtime, settings, pages: "CTX",
+    )
 
     main_mod.on_submit("check https://cache-me", image=None)
     main_mod.on_submit("check https://cache-me again", image=None)
@@ -419,9 +438,9 @@ def test_on_submit_uses_context_reference_on_followup(monkeypatch):
     monkeypatch.setattr(rt, "onboarding_needed", False)
     monkeypatch.setattr(rt, "target_hwnd", 0)
     monkeypatch.setattr(rt, "current_app", _App())
-    monkeypatch.setattr(main_mod, "build_context_prompt", lambda _app: "Active app: Browser")
-    monkeypatch.setattr(main_mod, "classify_response_mode", lambda **_kwargs: ResponseMode.WORK)
-    monkeypatch.setattr(main_mod, "extract_urls", lambda _text: [])
+    monkeypatch.setattr(turn_pipeline_mod, "build_context_prompt", lambda _app: "Active app: Browser")
+    monkeypatch.setattr(turn_pipeline_mod, "classify_response_mode", lambda **_kwargs: ResponseMode.WORK)
+    monkeypatch.setattr(turn_pipeline_mod, "extract_urls", lambda _text: [])
     monkeypatch.setitem(main_mod.cfg, "context_reference_refresh_turns", 3)
 
     main_mod.on_submit("first", image=None)
@@ -431,3 +450,83 @@ def test_on_submit_uses_context_reference_on_followup(monkeypatch):
     second_sent = fake_ai.calls[1]["question"]
     assert "[Context id:" in first_sent
     assert "[Context reference id:" in second_sent
+
+
+def test_restore_recent_session_restores_overlay_and_image(monkeypatch):
+    rt = main_mod.runtime
+    screenshot = Image.new("RGB", (4, 4))
+    restore_calls = []
+    restored_states = []
+
+    class _RecoverableAI:
+        history = ["existing"]
+
+        def restore_session_state(self, state):
+            restored_states.append(state)
+
+    class _Overlay:
+        def restore_session(self, **kwargs):
+            restore_calls.append(kwargs)
+
+    monkeypatch.setattr(rt, "ai", _RecoverableAI())
+    rt.recovery_snapshot = SessionRecoverySnapshot(
+        created_at=time.monotonic(),
+        view=RecoveryViewState(
+            answer_text="Recovered answer",
+            draft_text="follow-up",
+            response_mode=ResponseMode.WORK,
+            controls=ContextControls(screenshot=True, clipboard=False, urls=True, ocr=True),
+            availability=ContextAvailability(screenshot=True, clipboard=False, urls=True, ocr=True),
+        ),
+        assistant_state=object(),
+        window_title="BuddyGPT",
+        target_hwnd=123,
+        current_app=None,
+        clipboard_context_text="",
+        clipboard_context_pending=False,
+        static_context_hash="hash",
+        static_context_id="ctx12345",
+        static_context_last_full_turn=2,
+        turn_counter=2,
+        previous_context_blocks={"app": "[Active app: browser]"},
+        image=screenshot,
+    )
+
+    restored = main_mod._restore_recent_session(rt, _Overlay())
+
+    assert restored is True
+    assert restored_states
+    assert restore_calls[0]["answer_text"] == "Recovered answer"
+    assert restore_calls[0]["draft_text"] == "follow-up"
+    assert restore_calls[0]["image"] is screenshot
+    assert rt.recovery_snapshot is None
+
+
+def test_turn_pipeline_pack_context_blocks_keeps_required_block_before_optional_trim():
+    pipeline = turn_pipeline_mod.TurnPipeline()
+    packed, dropped, trimmed = pipeline._pack_context_blocks(
+        blocks=[
+            turn_pipeline_mod.ContextBlock(
+                name="browse_context",
+                text="x" * 950,
+                priority=20,
+                source="url",
+                allow_trim=True,
+            ),
+            turn_pipeline_mod.ContextBlock(
+                name="mode_hint",
+                text="[Mode hint] stay actionable",
+                priority=75,
+                source="mode_hint",
+                required=True,
+            ),
+        ],
+        question="q" * 50,
+        max_chars=1000,
+    )
+
+    packed_names = [name for name, _text in packed]
+    assert "mode_hint" in packed_names
+    assert "browse_context" in packed_names
+    assert trimmed is True
+    assert dropped == []

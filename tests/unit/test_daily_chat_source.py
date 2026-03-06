@@ -159,3 +159,36 @@ class TestNoCrossDayReplay:
         # Today's afternoon slot should be pending.
         pending = daily_source.pending_timed_slots(fake_state, today)
         assert "afternoon_1500" in pending
+
+
+def test_generate_for_slot_passes_search_hint_query(default_config, fake_state):
+    class _CapturingAI:
+        def __init__(self):
+            self.system_prompt = "fake-system"
+            self.max_tokens = 300
+            self.calls = []
+
+        def spawn_with_overrides(self, **_kwargs):
+            return self
+
+        def clear_history(self):
+            return None
+
+        def ask(self, question: str, image=None, **kwargs) -> str:
+            self.calls.append({"question": question, "image": image, **kwargs})
+            return json.dumps(
+                {
+                    "topic_key": "daily-topic",
+                    "message": "A current event opener.",
+                }
+            )
+
+    ai = _CapturingAI()
+    source = DailyChatSource(ai_assistant=ai, config=default_config)
+    now = datetime(2026, 2, 23, 9, 0)
+
+    result = source.generate_for_slot(WAKE_FIRST_SLOT, now, fake_state)
+
+    assert result is not None
+    assert ai.calls[0]["force_search_tool"] is True
+    assert "latest major news headlines 2026-02-23" in ai.calls[0]["search_hint_question"]
